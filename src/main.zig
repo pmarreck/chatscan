@@ -10,6 +10,8 @@ const output = @import("output.zig");
 const ripgrep = @import("ripgrep.zig");
 const conversation = @import("conversation.zig");
 
+const version = "0.1.0";
+
 const Defaults = struct {
     top_n: usize = 10,
     ollama_url: []const u8 = "http://localhost:11434",
@@ -70,6 +72,16 @@ pub fn main() !void {
         return;
     }
 
+    if (parsed.command == .about) {
+        try stdout.print("chatscan {s} — search Claude Code conversation history ({s}-{s})\n", .{
+            version,
+            @tagName(@import("builtin").target.os.tag),
+            @tagName(@import("builtin").target.cpu.arch),
+        });
+        try stdout.flush();
+        return;
+    }
+
     // Load config
     var cfg = config.loadConfig(allocator) catch Config_empty: {
         break :Config_empty config.Config{};
@@ -82,7 +94,7 @@ pub fn main() !void {
     defer if (settings.conversation_dir_owned) allocator.free(settings.conversation_dir);
 
     switch (parsed.command) {
-        .help => unreachable,
+        .help, .about => unreachable,
         .config => {
             try stdout.print("conversation_dir = {s}\n", .{settings.conversation_dir});
             try stdout.print("db_path = {s}\n", .{settings.db_path});

@@ -8,6 +8,7 @@ pub const OutputFormat = enum {
 
 pub const CommandTag = enum {
     help,
+    about,
     index,
     search,
     config,
@@ -87,6 +88,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                     i += 1;
                 }
                 continue;
+            }
+            if (std.mem.eql(u8, arg, "--about")) {
+                parsed.command = .about;
+                return parsed;
             }
             if (std.mem.eql(u8, arg, "--json")) {
                 parsed.output = .json;
