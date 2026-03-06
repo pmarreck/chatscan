@@ -1,6 +1,6 @@
 # chatscan
 
-[![Garnix](https://img.shields.io/endpoint.svg?url=https://garnix.io/api/badges/pmarreck/chatscan/yolo)](https://garnix.io)
+[![Garnix](https://img.shields.io/endpoint.svg?url=https://garnix.io/api/badges/pmarreck/chatscan)](https://garnix.io)
 [![Build](https://github.com/pmarreck/chatscan/actions/workflows/build.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/chatscan/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
