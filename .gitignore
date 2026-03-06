@@ -1,0 +1,7 @@
+/zig-cache/
+/zig-out/
+/zig-out-debug/
+.DS_Store
+.zig-cache
+result
+inbox

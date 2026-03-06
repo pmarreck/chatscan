@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [yolo]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Nix
+        shell: bash
+        run: ./scripts/ci-setup-nix
+
+      - name: Run tests
+        shell: bash
+        run: nix develop -c zig build test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-musl
+            archive: tar
+            ext: ""
+            artifact: chatscan-linux-x86_64.tar.gz
+            pkgdir: chatscan-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-linux-musl
+            archive: tar
+            ext: ""
+            artifact: chatscan-linux-arm64.tar.gz
+            pkgdir: chatscan-linux-arm64
+          - os: macos-14
+            target: aarch64-macos
+            archive: tar
+            ext: ""
+            artifact: chatscan-macos-arm64.tar.gz
+            pkgdir: chatscan-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Nix
+        shell: bash
+        run: ./scripts/ci-setup-nix
+
+      - name: Build ReleaseFast
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/ci-build "${{ matrix.target }}" "${{ matrix.pkgdir }}" "${{ matrix.artifact }}" "${{ matrix.ext }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/chatscan-linux-x86_64.tar.gz
+            dist/**/chatscan-linux-arm64.tar.gz
+            dist/**/chatscan-macos-arm64.tar.gz
+          generate_release_notes: true
