@@ -41,14 +41,57 @@ pub const RenamePlan = struct {
     }
 };
 
-/// Resolve a path argument to absolute. If it starts with '/', it's already absolute.
-/// Otherwise, resolve relative to cwd.
+/// Resolve a path argument to absolute, normalizing `.` and `..` components.
+/// If it starts with '/', it's absolute but still normalized.
+/// Otherwise, resolve relative to cwd first.
 pub fn resolvePath(allocator: std.mem.Allocator, path: []const u8, cwd: []const u8) ![]u8 {
-    if (path.len > 0 and path[0] == '/') {
-        return allocator.dupe(u8, path);
+    const joined = if (path.len > 0 and path[0] == '/')
+        try allocator.dupe(u8, path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path });
+    defer allocator.free(joined);
+
+    return normalizePath(allocator, joined);
+}
+
+/// Normalize a path by resolving `.` and `..` components.
+fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var components = std.ArrayListUnmanaged([]const u8){};
+    defer components.deinit(allocator);
+
+    var iter = std.mem.splitScalar(u8, path, '/');
+    while (iter.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) {
+            continue;
+        } else if (std.mem.eql(u8, component, "..")) {
+            if (components.items.len > 0) {
+                _ = components.pop();
+            }
+        } else {
+            try components.append(allocator, component);
+        }
     }
-    // Relative path — join with cwd
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path });
+
+    // Rebuild path
+    var total: usize = 0;
+    for (components.items) |c| {
+        total += 1 + c.len; // leading '/' + component
+    }
+    if (total == 0) total = 1; // root "/"
+
+    var result = try allocator.alloc(u8, total);
+    if (components.items.len == 0) {
+        result[0] = '/';
+        return result;
+    }
+    var pos: usize = 0;
+    for (components.items) |c| {
+        result[pos] = '/';
+        pos += 1;
+        @memcpy(result[pos..][0..c.len], c);
+        pos += c.len;
+    }
+    return result;
 }
 
 /// Convert a path to the Claude project directory slug format.
@@ -556,6 +599,32 @@ test "resolvePath basename only" {
     const path = try resolvePath(allocator, "new-name", "/some/cwd");
     defer allocator.free(path);
     try std.testing.expectEqualStrings("/some/cwd/new-name", path);
+}
+
+test "resolvePath with dotdot" {
+    const allocator = std.testing.allocator;
+    const path = try resolvePath(allocator, "../cur_name", "/Users/pmarreck/Documents/cur_name");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/Users/pmarreck/Documents/cur_name", path);
+}
+
+test "resolvePath with dotdot from inside project" {
+    const allocator = std.testing.allocator;
+    // Inside /a/b/old, rename ../old ../new
+    const old = try resolvePath(allocator, "../old", "/a/b/old");
+    defer allocator.free(old);
+    try std.testing.expectEqualStrings("/a/b/old", old);
+
+    const new = try resolvePath(allocator, "../new", "/a/b/old");
+    defer allocator.free(new);
+    try std.testing.expectEqualStrings("/a/b/new", new);
+}
+
+test "resolvePath absolute with dotdot" {
+    const allocator = std.testing.allocator;
+    const path = try resolvePath(allocator, "/a/b/../c", "/ignored");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/a/c", path);
 }
 
 fn getTmpDir(allocator: std.mem.Allocator) []const u8 {
