@@ -4,14 +4,14 @@
 [![Build](https://github.com/pmarreck/chatscan/actions/workflows/build.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/chatscan/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Search your Claude Code conversation history with semantic + lexical search.
+Search your AI coding conversation history with semantic + lexical + recency search.
 
-Claude Code stores all conversation transcripts as `.jsonl` files under `~/.claude/projects/`. These accumulate quickly and contain valuable context — past solutions, debugging sessions, architectural decisions. **chatscan** indexes them into SQLite (with FTS5 + optional vector embeddings via Ollama) and provides fast hybrid search.
+Supports **Claude Code**, **Codex**, and **Gemini CLI** conversations. Indexes them into SQLite (with FTS5 + optional vector embeddings via Ollama) and provides fast hybrid search with recency weighting.
 
 ## Quick start
 
 ```bash
-# Index your conversations
+# Index your conversations (auto-detects Claude, Codex, or Gemini)
 chatscan index
 
 # Search (scoped to current project by default)
@@ -19,6 +19,9 @@ chatscan "SIMD optimization"
 
 # Search all projects
 chatscan "error handling" --all
+
+# Search across all LLM sources
+chatscan "error handling" --all-llms
 
 # Regex search via ripgrep
 chatscan --regex "indexOfIgnoreCase"
@@ -29,10 +32,13 @@ chatscan "config" --json
 
 ## Features
 
-- **Hybrid search** — FTS5 lexical search + optional bge-large vector embeddings via Ollama
+- **Multi-LLM support** — indexes Claude (`~/.claude/projects/`), Codex (`~/.codex/sessions/`), and Gemini (`~/.gemini/tmp/`) conversations
+- **Hybrid search** — equally weighted semantic (vector), lexical (FTS5), and recency scoring
+- **Recency weighting** — recent conversations rank higher (exponential decay, 30-day half-life)
 - **Sandwich display** — matched message shown bold, with previous/next messages dimmed for context
 - **Auto-scoping** — searches are scoped to the current project by default (falls back to all if no conversations exist for cwd)
 - **Incremental indexing** — only re-indexes changed files based on mtime
+- **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
 - **Graceful degradation** — works without Ollama (lexical-only), warns and falls back automatically
 
@@ -65,6 +71,7 @@ zig build -Doptimize=ReleaseFast
 chatscan <query>              Search conversations (implicit)
 chatscan search <query>       Search conversations
 chatscan index                Index/update conversation database
+chatscan rename <old> <new>   Rename project dir + update all logs
 chatscan config               Show configuration
 chatscan help                 Show this help
 
@@ -78,6 +85,11 @@ Search options:
   --context-lines <n>           Lines to show per message (default 4)
   --json                        JSON output
 
+LLM source options:
+  --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)
+  --all-llms                    Search across all available LLM sources
+  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|all)
+
 Index options:
   --reindex                     Force full re-index
 
@@ -87,6 +99,80 @@ Global options:
   --ollama-url <url>            Ollama server URL
   --ollama-model <name>         Embedding model name
   --embedding-dim <n>           Embedding dimension
+```
+
+## Multi-LLM support
+
+chatscan auto-detects which LLM sources are available on your system:
+
+| LLM | Conversation directory | Format |
+|-----|----------------------|--------|
+| Claude Code | `~/.claude/projects/` | JSONL per session |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/` | JSONL with event_msg wrappers |
+| Gemini CLI | `~/.gemini/tmp/*/chats/` | JSON with messages array |
+
+```bash
+# Index only Codex conversations
+chatscan --llm codex index
+
+# Search only Gemini conversations
+chatscan --llm gemini "build system"
+
+# Index and search across all LLMs
+chatscan --all-llms index
+chatscan --all-llms "error handling" --all
+
+# Or set via environment variable
+export CHATSCAN_LLM=all
+chatscan index
+chatscan "your query"
+```
+
+## Project rename
+
+Rename a project directory and update all LLM conversation logs to match:
+
+```bash
+# Full paths
+chatscan rename /path/to/old-name /path/to/new-name
+
+# Basename shortcut (stays in same parent directory)
+chatscan rename /path/to/old-name new-name
+
+# Relative paths work too
+chatscan rename ./old-name ./new-name
+
+# From inside the project directory
+chatscan rename ../old-name ../new-name
+
+# Skip confirmation prompt
+chatscan rename old-name new-name --force
+```
+
+Before making any changes, chatscan shows a detailed plan:
+
+```
+chatscan rename: the following changes will be made:
+
+  Project directory:
+    mv /Users/you/projects/old-name
+     → /Users/you/projects/new-name
+
+  Claude conversations:
+    rename ~/.claude/projects/-Users-you-projects-old-name/
+         → ~/.claude/projects/-Users-you-projects-new-name/
+    (47 files)
+
+  Codex sessions:
+    update cwd in 12 session files
+
+  Gemini:
+    update .project_root in 2 project dirs
+
+  chatscan index:
+    update 834 indexed messages
+
+Proceed? [y/N]
 ```
 
 ## Configuration
