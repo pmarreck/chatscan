@@ -1,5 +1,20 @@
 const std = @import("std");
 
+pub const LlmSource = enum {
+    claude,
+    codex,
+    gemini,
+    all,
+
+    pub fn parse(value: []const u8) !LlmSource {
+        if (std.mem.eql(u8, value, "claude")) return .claude;
+        if (std.mem.eql(u8, value, "codex")) return .codex;
+        if (std.mem.eql(u8, value, "gemini")) return .gemini;
+        if (std.mem.eql(u8, value, "all")) return .all;
+        return error.InvalidLlmSource;
+    }
+};
+
 pub const Config = struct {
     conversation_dir: ?[]const u8 = null,
     db_path: ?[]const u8 = null,
@@ -43,11 +58,32 @@ pub fn defaultDbPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/index.sqlite3", .{dd});
 }
 
-/// Return the default conversation source directory.
+/// Return the default conversation source directory for a given LLM.
 pub fn defaultConversationDir(allocator: std.mem.Allocator) ![]u8 {
+    return defaultConversationDirForLlm(allocator, .claude);
+}
+
+pub fn defaultConversationDirForLlm(allocator: std.mem.Allocator, llm: LlmSource) ![]u8 {
     const home = try getHome(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.claude/projects", .{home});
+    return switch (llm) {
+        .claude => std.fmt.allocPrint(allocator, "{s}/.claude/projects", .{home}),
+        .codex => std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home}),
+        .gemini => std.fmt.allocPrint(allocator, "{s}/.gemini/tmp", .{home}),
+        .all => std.fmt.allocPrint(allocator, "{s}/.claude/projects", .{home}),
+    };
+}
+
+/// Detect which LLM sources exist on the system, returning the first available.
+pub fn detectDefaultLlm(allocator: std.mem.Allocator) !LlmSource {
+    const sources = [_]LlmSource{ .claude, .codex, .gemini };
+    for (sources) |llm| {
+        const dir = try defaultConversationDirForLlm(allocator, llm);
+        defer allocator.free(dir);
+        std.fs.accessAbsolute(dir, .{}) catch continue;
+        return llm;
+    }
+    return .claude; // fallback
 }
 
 /// Load config from the XDG config file. Returns default config if file doesn't exist.

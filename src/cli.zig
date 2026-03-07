@@ -1,5 +1,6 @@
 const std = @import("std");
 const search = @import("search.zig");
+const config = @import("config.zig");
 
 pub const OutputFormat = enum {
     human,
@@ -49,6 +50,7 @@ pub const Parsed = struct {
     regex_mode: bool = false,
     reindex: bool = false,
     force: bool = false,
+    llm_source: ?config.LlmSource = null,
 
     // Global
     db_path: ?[]const u8 = null,
@@ -142,6 +144,18 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
             }
             if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
                 parsed.force = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--llm")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.llm_source = config.LlmSource.parse(args[i]) catch return error.InvalidLlmSource;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--all-llms")) {
+                parsed.llm_source = .all;
                 i += 1;
                 continue;
             }

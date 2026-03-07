@@ -41,6 +41,15 @@ const Settings = struct {
     regex_mode: bool,
     reindex: bool,
     force: bool,
+    llm_source: config.LlmSource,
+    /// Extra conversation dirs for --all-llms mode
+    extra_dirs: []ExtraDir = &.{},
+
+    const ExtraDir = struct {
+        dir: []const u8,
+        llm: config.LlmSource,
+        owned: bool,
+    };
 };
 
 pub fn main() !void {
@@ -92,11 +101,21 @@ pub fn main() !void {
     const settings = try resolveSettings(allocator, parsed, cfg);
     defer if (settings.db_path_owned) allocator.free(settings.db_path);
     defer if (settings.conversation_dir_owned) allocator.free(settings.conversation_dir);
+    defer {
+        for (settings.extra_dirs) |ed| {
+            if (ed.owned) allocator.free(ed.dir);
+        }
+        allocator.free(settings.extra_dirs);
+    }
 
     switch (parsed.command) {
         .help, .about => unreachable,
         .config => {
+            try stdout.print("llm_source = {s}\n", .{@tagName(settings.llm_source)});
             try stdout.print("conversation_dir = {s}\n", .{settings.conversation_dir});
+            for (settings.extra_dirs) |ed| {
+                try stdout.print("extra_dir ({s}) = {s}\n", .{ @tagName(ed.llm), ed.dir });
+            }
             try stdout.print("db_path = {s}\n", .{settings.db_path});
             try stdout.print("ollama_url = {s}\n", .{settings.ollama_url});
             try stdout.print("ollama_model = {s}\n", .{settings.ollama_model});
@@ -132,19 +151,42 @@ pub fn main() !void {
             };
             const emb: ?embedding.Embedder = if (ollama_ok) embedder_adapter.embedder() else null;
 
-            const stats = try indexer.indexAll(
+            const primary_llm: config.LlmSource = if (settings.llm_source == .all) .claude else settings.llm_source;
+            const stats = try indexer.indexAllForLlm(
                 allocator,
                 db,
                 settings.conversation_dir,
+                primary_llm,
                 emb,
                 settings.batch_size,
                 settings.reindex,
                 stderr,
             );
 
-            try stdout.print("Indexed {d} files ({d} messages)\n", .{ stats.files_indexed, stats.messages_indexed });
-            if (stats.files_deleted > 0) {
-                try stdout.print("Removed {d} deleted files from index\n", .{stats.files_deleted});
+            var total_files = stats.files_indexed;
+            var total_messages = stats.messages_indexed;
+            var total_deleted = stats.files_deleted;
+
+            // Index extra LLM sources (--all-llms)
+            for (settings.extra_dirs) |ed| {
+                const extra_stats = indexer.indexAllForLlm(
+                    allocator,
+                    db,
+                    ed.dir,
+                    ed.llm,
+                    emb,
+                    settings.batch_size,
+                    settings.reindex,
+                    stderr,
+                ) catch continue;
+                total_files += extra_stats.files_indexed;
+                total_messages += extra_stats.messages_indexed;
+                total_deleted += extra_stats.files_deleted;
+            }
+
+            try stdout.print("Indexed {d} files ({d} messages)\n", .{ total_files, total_messages });
+            if (total_deleted > 0) {
+                try stdout.print("Removed {d} deleted files from index\n", .{total_deleted});
             }
             try stdout.flush();
         },
@@ -189,10 +231,16 @@ pub fn main() !void {
                 _ = stderr.print("No index found. Indexing conversations...\n", .{}) catch {};
                 _ = stderr.flush() catch {};
 
-                _ = indexer.indexAll(allocator, db, settings.conversation_dir, emb, settings.batch_size, false, stderr) catch |err| {
+                const primary_llm2: config.LlmSource = if (settings.llm_source == .all) .claude else settings.llm_source;
+                _ = indexer.indexAllForLlm(allocator, db, settings.conversation_dir, primary_llm2, emb, settings.batch_size, false, stderr) catch |err| {
                     _ = stderr.print("warning: indexing failed: {}\n", .{err}) catch {};
                     _ = stderr.flush() catch {};
                 };
+
+                // Index extra LLM sources
+                for (settings.extra_dirs) |ed| {
+                    _ = indexer.indexAllForLlm(allocator, db, ed.dir, ed.llm, emb, settings.batch_size, false, stderr) catch {};
+                }
             }
 
             // Detect current project for default filtering
@@ -235,6 +283,15 @@ pub fn main() !void {
 fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config.Config) !Settings {
     const defaults = Defaults{};
 
+    // Resolve LLM source: CLI flag > env var > auto-detect
+    const llm_source = if (parsed.llm_source) |llm| llm else blk: {
+        if (std.process.getEnvVarOwned(allocator, "CHATSCAN_LLM")) |env_val| {
+            defer allocator.free(env_val);
+            break :blk config.LlmSource.parse(env_val) catch .claude;
+        } else |_| {}
+        break :blk try config.detectDefaultLlm(allocator);
+    };
+
     // DB path
     var db_path: []const u8 = undefined;
     var db_path_owned = false;
@@ -247,16 +304,31 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         db_path_owned = true;
     }
 
-    // Conversation dir
+    // Conversation dir — depends on LLM source
     var conv_dir: []const u8 = undefined;
     var conv_dir_owned = false;
+    const effective_llm = if (llm_source == .all) config.LlmSource.claude else llm_source;
     if (parsed.conversation_dir) |p| {
         conv_dir = p;
     } else if (cfg.conversation_dir) |p| {
         conv_dir = p;
     } else {
-        conv_dir = try config.defaultConversationDir(allocator);
+        conv_dir = try config.defaultConversationDirForLlm(allocator, effective_llm);
         conv_dir_owned = true;
+    }
+
+    // For --all-llms, build extra dirs for the other LLM sources
+    var extra_dirs = std.ArrayListUnmanaged(Settings.ExtraDir){};
+    if (llm_source == .all) {
+        const other_sources = [_]config.LlmSource{ .codex, .gemini };
+        for (other_sources) |src| {
+            const dir = config.defaultConversationDirForLlm(allocator, src) catch continue;
+            std.fs.accessAbsolute(dir, .{}) catch {
+                allocator.free(dir);
+                continue;
+            };
+            try extra_dirs.append(allocator, .{ .dir = dir, .llm = src, .owned = true });
+        }
     }
 
     return Settings{
@@ -278,6 +350,8 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         .regex_mode = parsed.regex_mode,
         .reindex = parsed.reindex,
         .force = parsed.force,
+        .llm_source = llm_source,
+        .extra_dirs = try extra_dirs.toOwnedSlice(allocator),
     };
 }
 
@@ -403,7 +477,7 @@ fn ensureDbDir(allocator: std.mem.Allocator, db_path: []const u8) !void {
 
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\chatscan — search Claude conversation history
+        \\chatscan — search AI coding conversation history
         \\
         \\Usage:
         \\  chatscan <query>              Search conversations (implicit)
@@ -422,6 +496,11 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --context-lines <n>           Lines to show per message (default 4)
         \\  --json                        JSON output
         \\
+        \\LLM source options:
+        \\  --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)
+        \\  --all-llms                    Search across all available LLM sources
+        \\  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|all)
+        \\
         \\Index options:
         \\  --reindex                     Force full re-index
         \\
@@ -434,7 +513,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\
         \\Config file: $XDG_CONFIG_HOME/chatscan/config
         \\Database: $XDG_DATA_HOME/chatscan/index.sqlite3
-        \\Conversations: ~/.claude/projects/
+        \\Sources: ~/.claude/projects/, ~/.codex/sessions/, ~/.gemini/tmp/
         \\
     );
 }

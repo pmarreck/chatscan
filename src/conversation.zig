@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config.zig");
 
 pub const ParsedMessage = struct {
     role: []const u8,
@@ -140,6 +141,41 @@ fn extractTextContent(allocator: std.mem.Allocator, content_val: std.json.Value)
     }
 }
 
+/// Extract text from Gemini content arrays: [{text: "..."}, ...]
+fn extractGeminiTextContent(allocator: std.mem.Allocator, content_val: std.json.Value) ![]u8 {
+    if (content_val != .array) return allocator.alloc(u8, 0);
+
+    var parts = std.ArrayListUnmanaged([]const u8){};
+    defer parts.deinit(allocator);
+
+    for (content_val.array.items) |item_val| {
+        if (item_val != .object) continue;
+        const text_field = item_val.object.get("text") orelse continue;
+        if (text_field == .string and text_field.string.len > 0) {
+            try parts.append(allocator, text_field.string);
+        }
+    }
+
+    if (parts.items.len == 0) return allocator.alloc(u8, 0);
+
+    var total: usize = 0;
+    for (parts.items, 0..) |part, i| {
+        total += part.len;
+        if (i < parts.items.len - 1) total += 1;
+    }
+    var buf = try allocator.alloc(u8, total);
+    var pos: usize = 0;
+    for (parts.items, 0..) |part, i| {
+        @memcpy(buf[pos..][0..part.len], part);
+        pos += part.len;
+        if (i < parts.items.len - 1) {
+            buf[pos] = '\n';
+            pos += 1;
+        }
+    }
+    return buf;
+}
+
 /// Detect project name from the cwd path by walking up to find .git or .jj.
 /// Falls back to the last path component of cwd.
 fn detectProjectName(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
@@ -173,6 +209,224 @@ fn detectProjectName(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
 fn pathExists(path: []const u8) bool {
     std.fs.accessAbsolute(path, .{}) catch return false;
     return true;
+}
+
+/// Parse a Codex JSONL line. Codex wraps messages in event_msg payloads.
+pub fn parseCodexLine(allocator: std.mem.Allocator, line: []const u8, line_number: i64, project_dir: []const u8) !?ParsedMessage {
+    if (line.len == 0) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{
+        .allocate = .alloc_always,
+    }) catch return null;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    // Codex has two formats:
+    // 1. {type: "event_msg", payload: {type: "user_message"|"agent_message", message: "..."}}
+    // 2. {type: "session_meta", payload: {cwd: "..."}}
+    const type_val = root.object.get("type") orelse return null;
+    if (type_val != .string) return null;
+    if (!std.mem.eql(u8, type_val.string, "event_msg")) return null;
+
+    const payload = root.object.get("payload") orelse return null;
+    if (payload != .object) return null;
+    const payload_type = payload.object.get("type") orelse return null;
+    if (payload_type != .string) return null;
+
+    var role: []const u8 = undefined;
+    if (std.mem.eql(u8, payload_type.string, "user_message")) {
+        role = "user";
+    } else if (std.mem.eql(u8, payload_type.string, "agent_message")) {
+        role = "assistant";
+    } else return null;
+
+    const msg_val = payload.object.get("message") orelse return null;
+    if (msg_val != .string or msg_val.string.len == 0) return null;
+
+    const timestamp = if (root.object.get("timestamp")) |v| blk: {
+        if (v == .string) break :blk try allocator.dupe(u8, v.string);
+        break :blk null;
+    } else null;
+    errdefer if (timestamp) |t| allocator.free(t);
+
+    return ParsedMessage{
+        .role = try allocator.dupe(u8, role),
+        .content = try allocator.dupe(u8, msg_val.string),
+        .timestamp = timestamp,
+        .session_id = null,
+        .project_name = null,
+        .project_dir = try allocator.dupe(u8, project_dir),
+        .line_number = line_number,
+    };
+}
+
+/// Parse Gemini messages from a JSON session file.
+/// Returns all user/gemini messages from the file.
+pub fn parseGeminiFile(allocator: std.mem.Allocator, content: []const u8, project_dir: []const u8) ![]ParsedMessage {
+    var messages = std.ArrayListUnmanaged(ParsedMessage){};
+    errdefer {
+        for (messages.items) |*m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{
+        .allocate = .alloc_always,
+    }) catch return messages.toOwnedSlice(allocator);
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return messages.toOwnedSlice(allocator);
+
+    const msgs_val = root.object.get("messages") orelse return messages.toOwnedSlice(allocator);
+    if (msgs_val != .array) return messages.toOwnedSlice(allocator);
+
+    for (msgs_val.array.items, 0..) |item, idx| {
+        if (item != .object) continue;
+        const msg_type = item.object.get("type") orelse continue;
+        if (msg_type != .string) continue;
+
+        var role: []const u8 = undefined;
+        if (std.mem.eql(u8, msg_type.string, "user")) {
+            role = "user";
+        } else if (std.mem.eql(u8, msg_type.string, "gemini")) {
+            role = "assistant";
+        } else continue;
+
+        // Extract content
+        var text: []u8 = undefined;
+        if (item.object.get("content")) |content_val| {
+            if (content_val == .string) {
+                if (content_val.string.len == 0) continue;
+                text = try allocator.dupe(u8, content_val.string);
+            } else if (content_val == .array) {
+                // Gemini uses [{text: "..."}] without a type field
+                text = try extractGeminiTextContent(allocator, content_val);
+                if (text.len == 0) {
+                    allocator.free(text);
+                    continue;
+                }
+            } else continue;
+        } else continue;
+
+        const timestamp = if (item.object.get("timestamp")) |v| blk: {
+            if (v == .string) break :blk try allocator.dupe(u8, v.string);
+            break :blk null;
+        } else null;
+
+        try messages.append(allocator, .{
+            .role = try allocator.dupe(u8, role),
+            .content = text,
+            .timestamp = timestamp,
+            .session_id = null,
+            .project_name = null,
+            .project_dir = try allocator.dupe(u8, project_dir),
+            .line_number = @intCast(idx + 1),
+        });
+    }
+
+    return messages.toOwnedSlice(allocator);
+}
+
+/// Find conversation files for a given LLM source.
+pub fn findConversationFilesForLlm(allocator: std.mem.Allocator, conversation_dir: []const u8, llm: config.LlmSource) ![][]u8 {
+    return switch (llm) {
+        .claude => findConversationFiles(allocator, conversation_dir),
+        .codex => findCodexFiles(allocator, conversation_dir),
+        .gemini => findGeminiFiles(allocator, conversation_dir),
+        .all => unreachable, // caller handles .all by iterating sources
+    };
+}
+
+/// Find Codex session files: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u8 {
+    var files = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (files.items) |f| allocator.free(f);
+        files.deinit(allocator);
+    }
+
+    var year_dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return files.toOwnedSlice(allocator),
+        else => return err,
+    };
+    defer year_dir.close();
+
+    var year_iter = year_dir.iterate();
+    while (try year_iter.next()) |year_entry| {
+        if (year_entry.kind != .directory) continue;
+        var month_dir = year_dir.openDir(year_entry.name, .{ .iterate = true }) catch continue;
+        defer month_dir.close();
+
+        var month_iter = month_dir.iterate();
+        while (try month_iter.next()) |month_entry| {
+            if (month_entry.kind != .directory) continue;
+            var day_dir = month_dir.openDir(month_entry.name, .{ .iterate = true }) catch continue;
+            defer day_dir.close();
+
+            var day_iter = day_dir.iterate();
+            while (try day_iter.next()) |day_entry| {
+                if (day_entry.kind != .directory) continue;
+
+                var file_dir = day_dir.openDir(day_entry.name, .{ .iterate = true }) catch continue;
+                defer file_dir.close();
+
+                var file_iter = file_dir.iterate();
+                while (try file_iter.next()) |file_entry| {
+                    if (file_entry.kind != .file) continue;
+                    if (!std.mem.endsWith(u8, file_entry.name, ".jsonl")) continue;
+
+                    const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}/{s}", .{
+                        sessions_dir, year_entry.name, month_entry.name, day_entry.name, file_entry.name,
+                    });
+                    try files.append(allocator, full_path);
+                }
+            }
+        }
+    }
+
+    return files.toOwnedSlice(allocator);
+}
+
+/// Find Gemini chat files: ~/.gemini/tmp/*/chats/session-*.json
+fn findGeminiFiles(allocator: std.mem.Allocator, gemini_dir: []const u8) ![][]u8 {
+    var files = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (files.items) |f| allocator.free(f);
+        files.deinit(allocator);
+    }
+
+    var top_dir = std.fs.openDirAbsolute(gemini_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return files.toOwnedSlice(allocator),
+        else => return err,
+    };
+    defer top_dir.close();
+
+    var top_iter = top_dir.iterate();
+    while (try top_iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+
+        // Look for chats/ subdirectory
+        const chats_path = std.fmt.allocPrint(allocator, "{s}/{s}/chats", .{ gemini_dir, entry.name }) catch continue;
+        defer allocator.free(chats_path);
+
+        var chats_dir = std.fs.openDirAbsolute(chats_path, .{ .iterate = true }) catch continue;
+        defer chats_dir.close();
+
+        var chat_iter = chats_dir.iterate();
+        while (try chat_iter.next()) |chat_entry| {
+            if (chat_entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, chat_entry.name, ".json")) continue;
+
+            const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+                chats_path, chat_entry.name,
+            });
+            try files.append(allocator, full_path);
+        }
+    }
+
+    return files.toOwnedSlice(allocator);
 }
 
 /// Extract the project directory name from a .jsonl file path.
@@ -282,6 +536,71 @@ test "parseLine user message" {
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("user", msg.role);
     try std.testing.expectEqualStrings("hello", msg.content);
+}
+
+test "parseCodexLine user message" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"timestamp":"2026-03-06T23:05:09.185Z","type":"event_msg","payload":{"type":"user_message","message":"please read AGENTS.md","images":[]}}
+    ;
+    var msg = (try parseCodexLine(allocator, line, 1, "-codex")).?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("user", msg.role);
+    try std.testing.expectEqualStrings("please read AGENTS.md", msg.content);
+    try std.testing.expectEqualStrings("2026-03-06T23:05:09.185Z", msg.timestamp.?);
+}
+
+test "parseCodexLine agent message" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"timestamp":"2026-03-06T23:05:14.241Z","type":"event_msg","payload":{"type":"agent_message","message":"I'll load those files now.","phase":"commentary"}}
+    ;
+    var msg = (try parseCodexLine(allocator, line, 2, "-codex")).?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("assistant", msg.role);
+    try std.testing.expectEqualStrings("I'll load those files now.", msg.content);
+}
+
+test "parseCodexLine skips non-message types" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"timestamp":"2026-03-06T23:05:09.185Z","type":"event_msg","payload":{"type":"function_call","name":"read_file"}}
+    ;
+    const msg = try parseCodexLine(allocator, line, 1, "-codex");
+    try std.testing.expect(msg == null);
+}
+
+test "parseCodexLine skips session_meta" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"timestamp":"2026-03-06T23:05:09.184Z","type":"session_meta","payload":{"id":"abc","cwd":"/tmp"}}
+    ;
+    const msg = try parseCodexLine(allocator, line, 1, "-codex");
+    try std.testing.expect(msg == null);
+}
+
+test "parseGeminiFile basic" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"sessionId":"abc","messages":[
+        \\  {"id":"1","timestamp":"2026-02-21T22:38:46.224Z","type":"user","content":[{"text":"Hello from Gemini"}]},
+        \\  {"id":"2","timestamp":"2026-02-21T22:38:50.000Z","type":"gemini","content":"I will help you."},
+        \\  {"id":"3","timestamp":"2026-02-21T22:39:00.000Z","type":"info","content":"some info"}
+        \\]}
+    ;
+    const messages = try parseGeminiFile(allocator, json, "-gemini");
+    defer {
+        for (messages) |*m| {
+            var msg = m.*;
+            msg.deinit(allocator);
+        }
+        allocator.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("user", messages[0].role);
+    try std.testing.expectEqualStrings("Hello from Gemini", messages[0].content);
+    try std.testing.expectEqualStrings("assistant", messages[1].role);
+    try std.testing.expectEqualStrings("I will help you.", messages[1].content);
 }
 
 test "parseLine skips progress" {

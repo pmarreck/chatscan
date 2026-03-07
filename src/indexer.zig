@@ -2,6 +2,7 @@ const std = @import("std");
 const storage = @import("storage.zig");
 const conversation = @import("conversation.zig");
 const embedding = @import("embedding.zig");
+const config = @import("config.zig");
 
 pub const IndexStats = struct {
     files_scanned: usize = 0,
@@ -19,10 +20,23 @@ pub fn indexAll(
     force: bool,
     stderr: *std.Io.Writer,
 ) !IndexStats {
+    return indexAllForLlm(allocator, db, conversation_dir, .claude, embedder, batch_size, force, stderr);
+}
+
+pub fn indexAllForLlm(
+    allocator: std.mem.Allocator,
+    db: storage.Db,
+    conversation_dir: []const u8,
+    llm: config.LlmSource,
+    embedder: ?embedding.Embedder,
+    batch_size: usize,
+    force: bool,
+    stderr: *std.Io.Writer,
+) !IndexStats {
     var stats = IndexStats{};
 
     // Find all conversation files
-    const files = try conversation.findConversationFiles(allocator, conversation_dir);
+    const files = try conversation.findConversationFilesForLlm(allocator, conversation_dir, llm);
     defer {
         for (files) |f| allocator.free(f);
         allocator.free(files);
@@ -36,7 +50,7 @@ pub fn indexAll(
         return stats;
     }
 
-    _ = stderr.print("Scanning {d} conversation files...\n", .{files.len}) catch {};
+    _ = stderr.print("Scanning {d} {s} conversation files...\n", .{ files.len, @tagName(llm) }) catch {};
     _ = stderr.flush() catch {};
 
     // Get existing indexed files for incremental detection
@@ -90,51 +104,97 @@ pub fn indexAll(
         const content = readFile(allocator, file_path) catch continue;
         defer allocator.free(content);
 
-        var line_number: i64 = 0;
-        var max_line: i64 = start_line;
         var file_messages: usize = 0;
-        var line_iter = std.mem.splitScalar(u8, content, '\n');
+        var max_line: i64 = start_line;
 
-        while (line_iter.next()) |line| {
-            line_number += 1;
-            if (line_number <= start_line) continue;
-            if (line.len == 0) continue;
-
-            var msg = conversation.parseLine(allocator, line, line_number, project_dir) catch continue orelse continue;
-
-            // Insert into storage
-            const rowid = storage.insertMessage(db, .{
-                .file_path = file_path,
-                .line_number = msg.line_number,
-                .role = msg.role,
-                .content = msg.content,
-                .timestamp = msg.timestamp,
-                .session_id = msg.session_id,
-                .project_name = msg.project_name,
-                .project_dir = msg.project_dir,
-            }) catch {
-                msg.deinit(allocator);
-                continue;
-            };
-
-            // Queue for embedding
-            if (embedder != null) {
-                // Truncate content for embedding (max 1600 bytes)
-                const embed_text = if (msg.content.len > 1600)
-                    try allocator.dupe(u8, msg.content[0..1600])
-                else
-                    try allocator.dupe(u8, msg.content);
-                try embed_texts.append(allocator, embed_text);
-                try embed_rowids.append(allocator, rowid);
-
-                if (embed_texts.items.len >= batch_size) {
-                    try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+        if (llm == .gemini) {
+            // Gemini: JSON file with messages array
+            const messages = conversation.parseGeminiFile(allocator, content, project_dir) catch continue;
+            defer {
+                for (messages) |*m| {
+                    var msg = m.*;
+                    msg.deinit(allocator);
                 }
+                allocator.free(messages);
             }
 
-            msg.deinit(allocator);
-            file_messages += 1;
-            max_line = @max(max_line, line_number);
+            for (messages) |msg| {
+                const rowid = storage.insertMessage(db, .{
+                    .file_path = file_path,
+                    .line_number = msg.line_number,
+                    .role = msg.role,
+                    .content = msg.content,
+                    .timestamp = msg.timestamp,
+                    .session_id = msg.session_id,
+                    .project_name = msg.project_name,
+                    .project_dir = msg.project_dir,
+                }) catch continue;
+
+                if (embedder != null) {
+                    const embed_text = if (msg.content.len > 1600)
+                        try allocator.dupe(u8, msg.content[0..1600])
+                    else
+                        try allocator.dupe(u8, msg.content);
+                    try embed_texts.append(allocator, embed_text);
+                    try embed_rowids.append(allocator, rowid);
+
+                    if (embed_texts.items.len >= batch_size) {
+                        try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+                    }
+                }
+
+                file_messages += 1;
+                max_line = @max(max_line, msg.line_number);
+            }
+        } else {
+            // JSONL format (Claude or Codex)
+            var line_number: i64 = 0;
+            var line_iter = std.mem.splitScalar(u8, content, '\n');
+
+            while (line_iter.next()) |line| {
+                line_number += 1;
+                if (line_number <= start_line) continue;
+                if (line.len == 0) continue;
+
+                var msg = (switch (llm) {
+                    .claude => conversation.parseLine(allocator, line, line_number, project_dir),
+                    .codex => conversation.parseCodexLine(allocator, line, line_number, project_dir),
+                    else => unreachable,
+                }) catch continue orelse continue;
+
+                // Insert into storage
+                const rowid = storage.insertMessage(db, .{
+                    .file_path = file_path,
+                    .line_number = msg.line_number,
+                    .role = msg.role,
+                    .content = msg.content,
+                    .timestamp = msg.timestamp,
+                    .session_id = msg.session_id,
+                    .project_name = msg.project_name,
+                    .project_dir = msg.project_dir,
+                }) catch {
+                    msg.deinit(allocator);
+                    continue;
+                };
+
+                // Queue for embedding
+                if (embedder != null) {
+                    const embed_text = if (msg.content.len > 1600)
+                        try allocator.dupe(u8, msg.content[0..1600])
+                    else
+                        try allocator.dupe(u8, msg.content);
+                    try embed_texts.append(allocator, embed_text);
+                    try embed_rowids.append(allocator, rowid);
+
+                    if (embed_texts.items.len >= batch_size) {
+                        try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+                    }
+                }
+
+                msg.deinit(allocator);
+                file_messages += 1;
+                max_line = @max(max_line, line_number);
+            }
         }
 
         if (file_messages > 0) {

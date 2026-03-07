@@ -22,8 +22,9 @@ pub const Options = struct {
     top_n: usize = 10,
     candidate_multiplier: usize = 5,
     mode: SearchMode = .hybrid,
-    weight_vector: f32 = 0.7,
-    weight_lexical: f32 = 0.3,
+    weight_vector: f32 = 1.0 / 3.0,
+    weight_lexical: f32 = 1.0 / 3.0,
+    weight_recency: f32 = 1.0 / 3.0,
     score_dropoff: f32 = 0.3,
     role_filter: ?[]const u8 = null,
     project_filter: ?[]const u8 = null,
@@ -61,11 +62,13 @@ pub fn search(
 
     var weight_vector = options.weight_vector;
     var weight_lexical = options.weight_lexical;
+    var weight_recency = options.weight_recency;
     if (options.mode == .hybrid) {
-        const sum = weight_vector + weight_lexical;
+        const sum = weight_vector + weight_lexical + weight_recency;
         if (sum <= 0) return error.InvalidWeights;
         weight_vector /= sum;
         weight_lexical /= sum;
+        weight_recency /= sum;
     }
 
     var results = std.ArrayListUnmanaged(Result){};
@@ -148,13 +151,15 @@ pub fn search(
     }
 
     // Score and sort
+    const now_epoch = std.time.timestamp();
     for (results.items) |*res| {
         const vec_score: f32 = if (res.distance >= 0) 1.0 / (1.0 + res.distance) else 0;
         const lex_score: f32 = res.lexical;
+        const recency = computeRecencyScore(res.message.timestamp, now_epoch);
         res.score = switch (options.mode) {
             .lexical => lex_score,
             .vector => vec_score,
-            .hybrid => weight_vector * vec_score + weight_lexical * lex_score,
+            .hybrid => weight_vector * vec_score + weight_lexical * lex_score + weight_recency * recency,
         };
     }
 
@@ -455,6 +460,42 @@ fn columnTextOpt(stmt: *sqlite.sqlite3_stmt, col: c_int) ?[]const u8 {
     return ptr[0..@intCast(len)];
 }
 
+/// Compute a recency score from 0.0 (ancient) to 1.0 (now).
+/// Uses exponential decay with a half-life of 30 days.
+fn computeRecencyScore(timestamp: ?[]const u8, now_epoch: i64) f32 {
+    const ts = timestamp orelse return 0.0;
+    const msg_epoch = parseIso8601(ts) orelse return 0.0;
+    const age_secs = now_epoch - msg_epoch;
+    if (age_secs <= 0) return 1.0;
+    // Half-life of 30 days = 2592000 seconds
+    const half_life: f64 = 30.0 * 24.0 * 3600.0;
+    const decay: f64 = @exp(-0.693147 * @as(f64, @floatFromInt(age_secs)) / half_life);
+    return @floatCast(decay);
+}
+
+/// Parse a subset of ISO 8601 timestamps (YYYY-MM-DDTHH:MM:SS) to epoch seconds.
+fn parseIso8601(ts: []const u8) ?i64 {
+    // Minimum: "YYYY-MM-DDTHH:MM:SS" = 19 chars
+    if (ts.len < 19) return null;
+    const year = std.fmt.parseInt(i64, ts[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, ts[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, ts[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, ts[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, ts[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, ts[17..19], 10) catch return null;
+
+    // Days from epoch (1970-01-01) using the civil calendar algorithm
+    var y = year;
+    var m = month;
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    const era_days = 365 * y + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400) +
+        @divFloor(306 * (m + 1), 10) + day - 719591;
+    return era_days * 86400 + hour * 3600 + minute * 60 + second;
+}
+
 pub fn freeResults(allocator: std.mem.Allocator, results: []Result) void {
     for (results) |*res| {
         var r = res.*;
@@ -477,6 +518,33 @@ test "buildFtsQuery single token" {
     const q = try buildFtsQuery(allocator, "hello");
     defer allocator.free(q);
     try std.testing.expectEqualStrings("\"hello\"", q);
+}
+
+test "parseIso8601 basic" {
+    // 2026-03-07T12:00:00Z -> should produce a reasonable epoch
+    const epoch = parseIso8601("2026-03-07T12:00:00Z").?;
+    // 2026-03-07 is about 56 years after 1970, roughly 1.77 billion seconds
+    try std.testing.expect(epoch > 1_770_000_000);
+    try std.testing.expect(epoch < 1_780_000_000);
+}
+
+test "computeRecencyScore recent is high" {
+    const now = std.time.timestamp();
+    _ = now;
+    // A message from "now" should score ~1.0
+    const score_recent = computeRecencyScore("2026-03-07T12:00:00Z", parseIso8601("2026-03-07T12:00:00Z").?);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), score_recent, 0.01);
+}
+
+test "computeRecencyScore old is low" {
+    // A message from 6 months ago should score much lower
+    const now = parseIso8601("2026-03-07T12:00:00Z").?;
+    const score = computeRecencyScore("2025-09-07T12:00:00Z", now);
+    try std.testing.expect(score < 0.1);
+}
+
+test "computeRecencyScore null timestamp" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), computeRecencyScore(null, 0), 0.001);
 }
 
 test "search with empty query returns error" {
