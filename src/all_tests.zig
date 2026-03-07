@@ -9,4 +9,5 @@ comptime {
     _ = @import("output.zig");
     _ = @import("ollama.zig");
     _ = @import("embedding.zig");
+    _ = @import("rename.zig");
 }

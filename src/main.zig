@@ -9,6 +9,7 @@ const search_mod = @import("search.zig");
 const output = @import("output.zig");
 const ripgrep = @import("ripgrep.zig");
 const conversation = @import("conversation.zig");
+const rename_mod = @import("rename.zig");
 
 const version = "0.1.0";
 
@@ -81,6 +82,12 @@ pub fn main() !void {
         return;
     }
 
+    if (parsed.command == .rename) {
+        try handleRename(allocator, parsed, stdout, stderr);
+        try stdout.flush();
+        return;
+    }
+
     if (parsed.command == .about) {
         try stdout.print("chatscan {s} — search Claude Code conversation history ({s}-{s})\n", .{
             version,
@@ -109,7 +116,7 @@ pub fn main() !void {
     }
 
     switch (parsed.command) {
-        .help, .about => unreachable,
+        .help, .about, .rename => unreachable,
         .config => {
             try stdout.print("llm_source = {s}\n", .{@tagName(settings.llm_source)});
             try stdout.print("conversation_dir = {s}\n", .{settings.conversation_dir});
@@ -461,6 +468,102 @@ fn detectCurrentProjectDir(allocator: std.mem.Allocator, conversation_dir: []con
     return slug;
 }
 
+fn handleRename(
+    allocator: std.mem.Allocator,
+    parsed: cli.Parsed,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    _ = stderr;
+
+    const old_arg = parsed.rename_old orelse {
+        try stdout.writeAll("error: chatscan rename requires two arguments: <old-path> <new-path>\n");
+        try stdout.flush();
+        std.process.exit(64);
+    };
+    const new_arg = parsed.rename_new orelse {
+        try stdout.writeAll("error: chatscan rename requires two arguments: <old-path> <new-path>\n");
+        try stdout.flush();
+        std.process.exit(64);
+    };
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    const old_path = try rename_mod.resolvePath(allocator, old_arg, cwd);
+    defer allocator.free(old_path);
+
+    // If new_arg has no '/', treat as basename in same parent as old_path
+    const new_path = if (std.mem.indexOfScalar(u8, new_arg, '/') == null) blk: {
+        if (std.fs.path.dirname(old_path)) |parent| {
+            break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, new_arg });
+        }
+        break :blk try rename_mod.resolvePath(allocator, new_arg, cwd);
+    } else try rename_mod.resolvePath(allocator, new_arg, cwd);
+    defer allocator.free(new_path);
+
+    // Validate old path exists
+    std.fs.accessAbsolute(old_path, .{}) catch {
+        try stdout.print("error: old path does not exist: {s}\n", .{old_path});
+        try stdout.flush();
+        std.process.exit(1);
+    };
+
+    // Validate new path doesn't exist
+    std.fs.accessAbsolute(new_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {}, // good
+        else => {},
+    };
+    // If new path exists, error
+    if (std.fs.accessAbsolute(new_path, .{})) |_| {
+        try stdout.print("error: new path already exists: {s}\n", .{new_path});
+        try stdout.flush();
+        std.process.exit(1);
+    } else |_| {} // FileNotFound is expected
+
+    // Try to open the DB for index updates
+    const db_path = config.defaultDbPath(allocator) catch null;
+    defer if (db_path) |p| allocator.free(p);
+
+    var db: ?storage.Db = null;
+    if (db_path) |p| {
+        db = storage.openFileWithVec(allocator, p) catch null;
+    }
+    defer if (db) |d| storage.close(d);
+
+    if (db) |d| {
+        var schema_result = storage.initSchema(allocator, d, .{
+            .embedding_dim = 1024,
+        }) catch null;
+        if (schema_result) |*sr| sr.deinit(allocator);
+    }
+
+    // Build plan
+    var plan = try rename_mod.buildPlan(allocator, old_path, new_path, db);
+    defer plan.deinit();
+
+    // Print plan
+    try rename_mod.printPlan(&plan, stdout);
+    try stdout.flush();
+
+    // Confirm
+    if (!parsed.force) {
+        const confirmed = rename_mod.confirmPrompt(stdout) catch false;
+        if (!confirmed) {
+            try stdout.writeAll("Aborted.\n");
+            try stdout.flush();
+            return;
+        }
+    }
+
+    // Execute
+    rename_mod.executePlan(allocator, &plan, db, stdout) catch |err| {
+        try stdout.print("error: rename failed: {}\n", .{err});
+        try stdout.flush();
+        std.process.exit(1);
+    };
+}
+
 fn ensureDbDir(allocator: std.mem.Allocator, db_path: []const u8) !void {
     if (std.fs.path.dirname(db_path)) |dir| {
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
@@ -483,6 +586,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  chatscan <query>              Search conversations (implicit)
         \\  chatscan search <query>       Search conversations
         \\  chatscan index                Index/update conversation database
+        \\  chatscan rename <old> <new>    Rename project dir + update all logs
         \\  chatscan config               Show configuration
         \\  chatscan help                 Show this help
         \\

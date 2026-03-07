@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         "src/output.zig",
         "src/ollama.zig",
         "src/embedding.zig",
+        "src/rename.zig",
         "src/main.zig",
     };
 

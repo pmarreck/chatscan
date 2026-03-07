@@ -13,6 +13,7 @@ pub const CommandTag = enum {
     index,
     search,
     config,
+    rename,
 };
 
 pub const ConfigAction = enum {
@@ -51,6 +52,10 @@ pub const Parsed = struct {
     reindex: bool = false,
     force: bool = false,
     llm_source: ?config.LlmSource = null,
+
+    // Rename args
+    rename_old: ?[]const u8 = null,
+    rename_new: ?[]const u8 = null,
 
     // Global
     db_path: ?[]const u8 = null,
@@ -253,6 +258,21 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                         parsed.config_action = .show;
                         i += 1;
                     }
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "rename")) {
+                parsed.command = .rename;
+                verb_seen = true;
+                i += 1;
+                // Next two positional args are old and new paths
+                if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+                    parsed.rename_old = args[i];
+                    i += 1;
+                }
+                if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+                    parsed.rename_new = args[i];
+                    i += 1;
                 }
                 continue;
             }
