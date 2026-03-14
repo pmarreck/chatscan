@@ -46,10 +46,30 @@ chatscan "config" --json
 
 ### With Nix (recommended)
 
+This project uses [Nix flakes](https://nixos.wiki/wiki/Flakes), which require the `nix-command` and `flakes` experimental features to be enabled.
+
+**One-time run (no install):**
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' run github:pmarreck/chatscan -- "your query"
+```
+
+**Install into your profile:**
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' profile install github:pmarreck/chatscan
+```
+
+**To avoid typing the flags every time**, add this to your `~/.config/nix/nix.conf` (or `/etc/nix/nix.conf`):
+
+```
+experimental-features = nix-command flakes
+```
+
+Then you can use the shorter form:
+
 ```bash
 nix run github:pmarreck/chatscan -- "your query"
-
-# Or install into your profile
 nix profile install github:pmarreck/chatscan
 ```
 
