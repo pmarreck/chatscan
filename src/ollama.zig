@@ -74,13 +74,48 @@ pub fn buildEmbedRequest(
 	inputs: []const []const u8,
 	keep_alive: ?i64,
 ) ![]u8 {
-	const payload = EmbedRequest{ .model = model, .input = inputs, .keep_alive = keep_alive };
+	// Manual JSON construction — Zig 0.15's auto-serializer encodes []const u8
+	// inside []const []const u8 as byte arrays [84,104,...] instead of strings.
 	var out: std.io.Writer.Allocating = .init(allocator);
 	defer out.deinit();
+	const w = &out.writer;
 
-	var stream: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
-	try stream.write(payload);
+	try w.writeAll("{\"model\":");
+	try writeJsonString(w, model);
+	try w.writeAll(",\"input\":[");
+	for (inputs, 0..) |input, i| {
+		if (i > 0) try w.writeAll(",");
+		try writeJsonString(w, input);
+	}
+	try w.writeAll("],\"truncate\":true");
+	if (keep_alive) |ka| {
+		try w.print(",\"keep_alive\":{d}", .{ka});
+	}
+	try w.writeAll("}");
 	return out.toOwnedSlice();
+}
+
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+	try writer.writeAll("\"");
+	for (s) |c| {
+		switch (c) {
+			'"' => try writer.writeAll("\\\""),
+			'\\' => try writer.writeAll("\\\\"),
+			'\n' => try writer.writeAll("\\n"),
+			'\r' => try writer.writeAll("\\r"),
+			'\t' => try writer.writeAll("\\t"),
+			0x08 => try writer.writeAll("\\b"),
+			0x0C => try writer.writeAll("\\f"),
+			else => {
+				if (c < 0x20) {
+					try writer.print("\\u{x:0>4}", .{c});
+				} else {
+					try writer.writeByte(c);
+				}
+			},
+		}
+	}
+	try writer.writeAll("\"");
 }
 
 pub fn ensureModelAvailable(
@@ -207,12 +242,6 @@ fn parseNumber(value: std.json.Value) !f32 {
 	}
 }
 
-const EmbedRequest = struct {
-	model: []const u8,
-	input: []const []const u8,
-	keep_alive: ?i64 = null,
-};
-
 pub const StdHttpTransport = struct {
 	client: std.http.Client,
 
@@ -277,7 +306,7 @@ test "buildEmbedRequest serializes inputs" {
 	const inputs = [_][]const u8{ "hello", "world" };
 	const body = try buildEmbedRequest(allocator, "bge-large", &inputs, null);
 	defer allocator.free(body);
-	try std.testing.expectEqualStrings("{\"model\":\"bge-large\",\"input\":[\"hello\",\"world\"]}", body);
+	try std.testing.expectEqualStrings("{\"model\":\"bge-large\",\"input\":[\"hello\",\"world\"],\"truncate\":true}", body);
 }
 
 test "buildEmbedRequest includes keep_alive when set" {
@@ -285,7 +314,7 @@ test "buildEmbedRequest includes keep_alive when set" {
 	const inputs = [_][]const u8{"hello"};
 	const body = try buildEmbedRequest(allocator, "bge-large", &inputs, -1);
 	defer allocator.free(body);
-	try std.testing.expectEqualStrings("{\"model\":\"bge-large\",\"input\":[\"hello\"],\"keep_alive\":-1}", body);
+	try std.testing.expectEqualStrings("{\"model\":\"bge-large\",\"input\":[\"hello\"],\"truncate\":true,\"keep_alive\":-1}", body);
 }
 
 test "parseEmbeddings reads vectors" {

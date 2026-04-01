@@ -244,13 +244,18 @@ fn flushEmbeddingBatch(
 ) !void {
     if (texts.items.len == 0) return;
 
-    const embeddings = embedder.embed(embedder.ctx, allocator, texts.items) catch |err| {
-        // On embedding failure, skip but don't crash
-        var buf: [256]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        const err_writer = &w.interface;
-        _ = err_writer.print("warning: embedding batch failed: {}\n", .{err}) catch {};
-        _ = err_writer.flush() catch {};
+    const embeddings = embedder.embed(embedder.ctx, allocator, texts.items) catch {
+        // Batch failed (e.g. one input exceeds context length) — retry individually
+        for (texts.items, 0..) |text, idx| {
+            const single = [_][]const u8{text};
+            const single_emb = embedder.embed(embedder.ctx, allocator, &single) catch {
+                continue; // Skip this input
+            };
+            defer embedder.free(embedder.ctx, allocator, single_emb);
+            if (single_emb.len > 0) {
+                storage.insertEmbedding(db, allocator, rowids.items[idx], single_emb[0]) catch {};
+            }
+        }
         for (texts.items) |t| allocator.free(t);
         texts.clearRetainingCapacity();
         rowids.clearRetainingCapacity();
