@@ -372,9 +372,9 @@ fn tryInitOllama(
     ollama.ensureModelAvailable(allocator, http_client.transport(), ollama_url, ollama_model) catch |err| {
         switch (err) {
             error.ModelLoading => {
-                _ = stderr.print("note: Ollama model '{s}' is loading. Embeddings will be generated once loaded.\n", .{ollama_model}) catch {};
+                _ = stderr.print("note: Ollama model '{s}' is loading. Re-run 'chatscan index' once loaded for embeddings.\n", .{ollama_model}) catch {};
                 _ = stderr.flush() catch {};
-                return true;
+                return false;
             },
             else => {
                 _ = stderr.print("note: Ollama not available ({s}). Falling back to lexical search.\n", .{ollama_url}) catch {};
