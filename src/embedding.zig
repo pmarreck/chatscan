@@ -1,10 +1,36 @@
 const std = @import("std");
 const ollama = @import("ollama.zig");
+const openai_embedder = @import("openai_embedder.zig");
 
 pub const Embedder = struct {
 	ctx: *anyopaque,
 	embed: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32,
 	free: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, embeddings: [][]f32) void,
+};
+
+pub const OpenAIEmbedder = struct {
+	transport: openai_embedder.Transport,
+	base_url: []const u8,
+	api_key: ?[]const u8 = null,
+	model: []const u8,
+
+	pub fn embedder(self: *OpenAIEmbedder) Embedder {
+		return .{
+			.ctx = self,
+			.embed = embed,
+			.free = free,
+		};
+	}
+
+	fn embed(ctx: *anyopaque, allocator: std.mem.Allocator, inputs: []const []const u8) ![][]f32 {
+		const self: *OpenAIEmbedder = @ptrCast(@alignCast(ctx));
+		return openai_embedder.embed(allocator, self.transport, self.base_url, self.api_key, self.model, inputs);
+	}
+
+	fn free(ctx: *anyopaque, allocator: std.mem.Allocator, embeddings: [][]f32) void {
+		_ = ctx;
+		openai_embedder.freeEmbeddings(allocator, embeddings);
+	}
 };
 
 pub const OllamaEmbedder = struct {

@@ -49,8 +49,10 @@ pub fn build(b: *std.Build) void {
         "src/ripgrep.zig",
         "src/output.zig",
         "src/ollama.zig",
+        "src/openai_embedder.zig",
         "src/embedding.zig",
         "src/rename.zig",
+        "src/env_expand.zig",
         "src/main.zig",
     };
 

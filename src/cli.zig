@@ -30,6 +30,10 @@ pub const Seen = struct {
     conversation_dir: bool = false,
     search_mode: bool = false,
     project: bool = false,
+    embedding_backend: bool = false,
+    embedding_url: bool = false,
+    embedding_model: bool = false,
+    embedding_api_key: bool = false,
 };
 
 pub const Parsed = struct {
@@ -63,6 +67,10 @@ pub const Parsed = struct {
     ollama_model: ?[]const u8 = null,
     embedding_dim: ?usize = null,
     conversation_dir: ?[]const u8 = null,
+    embedding_backend: ?config.EmbeddingBackend = null,
+    embedding_url: ?[]const u8 = null,
+    embedding_model: ?[]const u8 = null,
+    embedding_api_key: ?[]const u8 = null,
 
     seen: Seen = .{},
 
@@ -219,6 +227,38 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--backend") or std.mem.eql(u8, arg, "--embedding-backend")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.embedding_backend = config.EmbeddingBackend.parse(args[i]) catch return error.InvalidBackend;
+                parsed.seen.embedding_backend = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--embedding-url")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.embedding_url = args[i];
+                parsed.seen.embedding_url = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--embedding-model")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.embedding_model = args[i];
+                parsed.seen.embedding_model = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--embedding-api-key")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.embedding_api_key = args[i];
+                parsed.seen.embedding_api_key = true;
+                i += 1;
+                continue;
+            }
             return error.UnknownFlag;
         }
 
@@ -357,6 +397,30 @@ test "parse project filter" {
     var parsed = try parse(allocator, &args);
     defer parsed.deinit(allocator);
     try std.testing.expectEqualStrings("codescan", parsed.project.?);
+}
+
+test "parse --backend openai" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "chatscan", "index", "--backend", "openai" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(config.EmbeddingBackend.openai, parsed.embedding_backend.?);
+}
+
+test "parse --backend mlx maps to openai" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "chatscan", "index", "--backend", "mlx" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(config.EmbeddingBackend.openai, parsed.embedding_backend.?);
+}
+
+test "parse --embedding-api-key" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "chatscan", "index", "--embedding-api-key", "sk-xyz" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("sk-xyz", parsed.embedding_api_key.?);
 }
 
 test "parse no args" {

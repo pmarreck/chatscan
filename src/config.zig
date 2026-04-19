@@ -1,4 +1,18 @@
 const std = @import("std");
+const env_expand = @import("env_expand.zig");
+
+pub const EmbeddingBackend = enum {
+    ollama,
+    openai,
+
+    pub fn parse(value: []const u8) !EmbeddingBackend {
+        if (std.mem.eql(u8, value, "ollama")) return .ollama;
+        if (std.mem.eql(u8, value, "openai")) return .openai;
+        if (std.mem.eql(u8, value, "mlx")) return .openai;
+        if (std.mem.eql(u8, value, "omlx")) return .openai;
+        return error.InvalidBackend;
+    }
+};
 
 pub const LlmSource = enum {
     claude,
@@ -21,6 +35,13 @@ pub const Config = struct {
     ollama_url: ?[]const u8 = null,
     ollama_model: ?[]const u8 = null,
     embedding_dim: ?usize = null,
+    embedding_backend: ?EmbeddingBackend = null,
+    embedding_url: ?[]const u8 = null,
+    embedding_model: ?[]const u8 = null,
+    embedding_api_key: ?[]const u8 = null,
+    // Raw pre-expansion value for embedding_api_key, used to preserve ${VAR}
+    // placeholders when rewriting the config file.
+    embedding_api_key_raw: ?[]const u8 = null,
     owned_strings: std.ArrayListUnmanaged([]u8) = .{},
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -119,21 +140,28 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8) !Config {
             const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
 
             if (std.mem.eql(u8, key, "conversation_dir")) {
-                const owned = try allocator.dupe(u8, value);
-                try cfg.owned_strings.append(allocator, owned);
-                cfg.conversation_dir = owned;
+                cfg.conversation_dir = try storeExpanded(allocator, &cfg, value);
             } else if (std.mem.eql(u8, key, "db_path")) {
-                const owned = try allocator.dupe(u8, value);
-                try cfg.owned_strings.append(allocator, owned);
-                cfg.db_path = owned;
+                cfg.db_path = try storeExpanded(allocator, &cfg, value);
             } else if (std.mem.eql(u8, key, "ollama_url")) {
-                const owned = try allocator.dupe(u8, value);
-                try cfg.owned_strings.append(allocator, owned);
-                cfg.ollama_url = owned;
+                cfg.ollama_url = try storeExpanded(allocator, &cfg, value);
             } else if (std.mem.eql(u8, key, "ollama_model")) {
-                const owned = try allocator.dupe(u8, value);
-                try cfg.owned_strings.append(allocator, owned);
-                cfg.ollama_model = owned;
+                cfg.ollama_model = try storeExpanded(allocator, &cfg, value);
+            } else if (std.mem.eql(u8, key, "embedding_url")) {
+                cfg.embedding_url = try storeExpanded(allocator, &cfg, value);
+            } else if (std.mem.eql(u8, key, "embedding_model")) {
+                cfg.embedding_model = try storeExpanded(allocator, &cfg, value);
+            } else if (std.mem.eql(u8, key, "embedding_backend")) {
+                const expanded = try storeExpanded(allocator, &cfg, value);
+                cfg.embedding_backend = EmbeddingBackend.parse(expanded) catch null;
+            } else if (std.mem.eql(u8, key, "embedding_api_key")) {
+                // Secret field: preserve raw placeholder if it contains any ${VAR}
+                if (env_expand.hasEnvRef(value)) {
+                    const raw = try allocator.dupe(u8, value);
+                    try cfg.owned_strings.append(allocator, raw);
+                    cfg.embedding_api_key_raw = raw;
+                }
+                cfg.embedding_api_key = try storeExpanded(allocator, &cfg, value);
             } else if (std.mem.eql(u8, key, "embedding_dim")) {
                 cfg.embedding_dim = std.fmt.parseInt(usize, value, 10) catch null;
             }
@@ -142,8 +170,77 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8) !Config {
     return cfg;
 }
 
+fn storeExpanded(
+    allocator: std.mem.Allocator,
+    cfg: *Config,
+    value: []const u8,
+) ![]u8 {
+    const expanded = try env_expand.expandEnvVars(allocator, value);
+    try cfg.owned_strings.append(allocator, expanded);
+    return expanded;
+}
+
 fn getHome(allocator: std.mem.Allocator) ![]u8 {
     return std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn testSetEnv(name: [:0]const u8, value: [:0]const u8) void {
+    _ = setenv(name.ptr, value.ptr, 1);
+}
+
+fn testUnsetEnv(name: [:0]const u8) void {
+    _ = unsetenv(name.ptr);
+}
+
+test "parseConfig expands ${VAR} in non-secret fields" {
+    testSetEnv("CHATSCAN_CFG_URL", "http://localhost:9999");
+    defer testUnsetEnv("CHATSCAN_CFG_URL");
+
+    const content = "ollama_url = ${CHATSCAN_CFG_URL}\n";
+    var cfg = try parseConfig(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("http://localhost:9999", cfg.ollama_url.?);
+}
+
+test "parseConfig preserves raw placeholder for api key" {
+    testSetEnv("CHATSCAN_CFG_KEY", "sk-secret-1234");
+    defer testUnsetEnv("CHATSCAN_CFG_KEY");
+
+    const content = "embedding_api_key = ${CHATSCAN_CFG_KEY}\n";
+    var cfg = try parseConfig(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("sk-secret-1234", cfg.embedding_api_key.?);
+    try std.testing.expectEqualStrings("${CHATSCAN_CFG_KEY}", cfg.embedding_api_key_raw.?);
+}
+
+test "parseConfig api key without env-ref has no raw" {
+    const content = "embedding_api_key = literal-key\n";
+    var cfg = try parseConfig(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("literal-key", cfg.embedding_api_key.?);
+    try std.testing.expect(cfg.embedding_api_key_raw == null);
+}
+
+test "parseConfig parses embedding_backend" {
+    const content = "embedding_backend = openai\n";
+    var cfg = try parseConfig(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(EmbeddingBackend.openai, cfg.embedding_backend.?);
+}
+
+test "parseConfig accepts mlx as alias for openai" {
+    const content = "embedding_backend = mlx\n";
+    var cfg = try parseConfig(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(EmbeddingBackend.openai, cfg.embedding_backend.?);
 }
 
 test "defaultConversationDir returns expected path" {

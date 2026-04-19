@@ -6,7 +6,7 @@
 
 Search your AI coding conversation history with semantic + lexical + recency search.
 
-Supports **Claude Code**, **Codex**, and **Gemini CLI** conversations. Indexes them into SQLite (with FTS5 + optional vector embeddings via Ollama) and provides fast hybrid search with recency weighting.
+Supports **Claude Code**, **Codex**, and **Gemini CLI** conversations. Indexes them into SQLite (with FTS5 + optional vector embeddings via **Ollama** or any **OpenAI-compatible** server like **oMLX**) and provides fast hybrid search with recency weighting.
 
 ## Quick start
 
@@ -40,7 +40,9 @@ chatscan "config" --json
 - **Incremental indexing** — only re-indexes changed files based on mtime
 - **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
-- **Graceful degradation** — works without Ollama (lexical-only), warns and falls back automatically
+- **Pluggable embedding backends** — Ollama (default) or any OpenAI-compatible server (oMLX, LM Studio, vLLM, etc.)
+- **Env-var expansion in config** — `${VAR}` / `${VAR:-default}` so secrets like API keys stay out of committed configs
+- **Graceful degradation** — works without an embedder (lexical-only), warns and falls back automatically
 
 ## Installation
 
@@ -96,8 +98,12 @@ Index options:
 Global options:
   --db <path>                   SQLite database path
   --conversation-dir <path>     Conversation files directory
-  --ollama-url <url>            Ollama server URL
-  --ollama-model <name>         Embedding model name
+  --ollama-url <url>            Ollama server URL (backend=ollama)
+  --ollama-model <name>         Embedding model name (backend=ollama)
+  --backend <ollama|openai|mlx> Embedding backend (default: ollama)
+  --embedding-url <url>         Override embedding server URL
+  --embedding-model <name>      Override embedding model name
+  --embedding-api-key <key>     API key for OpenAI-compatible backend
   --embedding-dim <n>           Embedding dimension
 ```
 
@@ -182,12 +188,37 @@ Config file: `$XDG_CONFIG_HOME/chatscan/config` (default `~/.config/chatscan/con
 ```
 conversation_dir = ~/.claude/projects
 db_path = ~/.local/share/chatscan/index.sqlite3
+
+# Ollama backend (default)
+embedding_backend = ollama
 ollama_url = http://localhost:11434
 ollama_model = bge-large
 embedding_dim = 1024
+
+# Or OpenAI-compatible backend (oMLX, LM Studio, vLLM, etc.)
+# embedding_backend = openai            # "mlx" and "omlx" also accepted
+# embedding_url = http://localhost:10240
+# embedding_model = text-embedding-3-small
+# embedding_api_key = ${OMLX_API_KEY}   # env var expansion supported
 ```
 
-## Optional: semantic search with Ollama
+### Env-var expansion in config
+
+Values support shell-style expansion so secrets can stay out of committed configs:
+
+| Form          | Behavior                                           |
+|---------------|----------------------------------------------------|
+| `$VAR`        | simple reference                                   |
+| `${VAR}`      | braced reference                                   |
+| `${VAR:-DEF}` | default if `VAR` is unset **or empty**             |
+| `${VAR-DEF}`  | default if `VAR` is **unset only**                 |
+| `$$`          | literal `$`                                        |
+
+For secret fields (e.g. `embedding_api_key`), chatscan remembers the raw `${VAR}` text so future config rewrites preserve the placeholder rather than baking in the resolved value.
+
+## Embedding backends
+
+### Ollama (default)
 
 For vector-based semantic search, install and run [Ollama](https://ollama.ai) with an embedding model:
 
@@ -196,6 +227,26 @@ ollama pull bge-large
 chatscan index    # will generate embeddings
 chatscan "your query" --mode hybrid
 ```
+
+### oMLX / OpenAI-compatible
+
+Any OpenAI-compatible `/v1/embeddings` endpoint works — oMLX, LM Studio, vLLM, the real OpenAI API, etc.
+
+```bash
+# Flags
+chatscan --backend mlx \
+         --embedding-url http://localhost:10240 \
+         --embedding-model text-embedding-3-small \
+         --embedding-api-key sk-your-key \
+         index
+
+# Env vars
+export CHATSCAN_EMBEDDING_BACKEND=mlx
+export CHATSCAN_EMBEDDING_API_KEY=sk-your-key
+chatscan index
+```
+
+`mlx` and `omlx` are accepted as aliases for `openai` everywhere the backend is named.
 
 Without Ollama, chatscan falls back to FTS5 lexical search automatically.
 

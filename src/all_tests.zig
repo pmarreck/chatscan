@@ -8,6 +8,8 @@ comptime {
     _ = @import("ripgrep.zig");
     _ = @import("output.zig");
     _ = @import("ollama.zig");
+    _ = @import("openai_embedder.zig");
     _ = @import("embedding.zig");
     _ = @import("rename.zig");
+    _ = @import("env_expand.zig");
 }

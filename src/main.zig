@@ -17,6 +17,8 @@ const Defaults = struct {
     top_n: usize = 10,
     ollama_url: []const u8 = "http://localhost:11434",
     ollama_model: []const u8 = "bge-large",
+    openai_url: []const u8 = "http://localhost:10240",
+    openai_model: []const u8 = "text-embedding-3-small",
     embedding_dim: usize = 1024,
     batch_size: usize = 16,
     search_mode: search_mod.SearchMode = .hybrid,
@@ -32,6 +34,11 @@ const Settings = struct {
     conversation_dir_owned: bool,
     ollama_url: []const u8,
     ollama_model: []const u8,
+    embedding_backend: config.EmbeddingBackend,
+    embedding_url: []const u8,
+    embedding_model: []const u8,
+    embedding_api_key: ?[]const u8,
+    embedding_api_key_owned: bool,
     embedding_dim: usize,
     batch_size: usize,
     search_mode: search_mod.SearchMode,
@@ -108,6 +115,9 @@ pub fn main() !void {
     const settings = try resolveSettings(allocator, parsed, cfg);
     defer if (settings.db_path_owned) allocator.free(settings.db_path);
     defer if (settings.conversation_dir_owned) allocator.free(settings.conversation_dir);
+    defer if (settings.embedding_api_key_owned) {
+        if (settings.embedding_api_key) |k| allocator.free(k);
+    };
     defer {
         for (settings.extra_dirs) |ed| {
             if (ed.owned) allocator.free(ed.dir);
@@ -124,8 +134,10 @@ pub fn main() !void {
                 try stdout.print("extra_dir ({s}) = {s}\n", .{ @tagName(ed.llm), ed.dir });
             }
             try stdout.print("db_path = {s}\n", .{settings.db_path});
-            try stdout.print("ollama_url = {s}\n", .{settings.ollama_url});
-            try stdout.print("ollama_model = {s}\n", .{settings.ollama_model});
+            try stdout.print("embedding_backend = {s}\n", .{@tagName(settings.embedding_backend)});
+            try stdout.print("embedding_url = {s}\n", .{settings.embedding_url});
+            try stdout.print("embedding_model = {s}\n", .{settings.embedding_model});
+            try stdout.print("embedding_api_key = {s}\n", .{if (settings.embedding_api_key) |_| "<set>" else "<unset>"});
             try stdout.print("embedding_dim = {d}\n", .{settings.embedding_dim});
             try stdout.flush();
         },
@@ -149,14 +161,9 @@ pub fn main() !void {
             // Try to set up embedder
             var http_client = ollama.StdHttpTransport.init(allocator);
             defer http_client.deinit();
-            const ollama_ok = tryInitOllama(allocator, &http_client, settings.ollama_url, settings.ollama_model, stderr);
-
-            var embedder_adapter = embedding.OllamaEmbedder{
-                .transport = http_client.transport(),
-                .base_url = settings.ollama_url,
-                .model = settings.ollama_model,
-            };
-            const emb: ?embedding.Embedder = if (ollama_ok) embedder_adapter.embedder() else null;
+            var ollama_adapter: embedding.OllamaEmbedder = undefined;
+            var openai_adapter: embedding.OpenAIEmbedder = undefined;
+            const emb = setupEmbedder(allocator, &http_client, settings, stderr, &ollama_adapter, &openai_adapter);
 
             const primary_llm: config.LlmSource = if (settings.llm_source == .all) .claude else settings.llm_source;
             const stats = try indexer.indexAllForLlm(
@@ -221,17 +228,12 @@ pub fn main() !void {
             });
             defer schema_result.deinit(allocator);
 
-            // Set up HTTP client for Ollama
+            // Set up HTTP client + embedder
             var http_client = ollama.StdHttpTransport.init(allocator);
             defer http_client.deinit();
-            const ollama_ok = tryInitOllama(allocator, &http_client, settings.ollama_url, settings.ollama_model, stderr);
-
-            var embedder_adapter = embedding.OllamaEmbedder{
-                .transport = http_client.transport(),
-                .base_url = settings.ollama_url,
-                .model = settings.ollama_model,
-            };
-            const emb: ?embedding.Embedder = if (ollama_ok) embedder_adapter.embedder() else null;
+            var ollama_adapter: embedding.OllamaEmbedder = undefined;
+            var openai_adapter: embedding.OpenAIEmbedder = undefined;
+            const emb = setupEmbedder(allocator, &http_client, settings, stderr, &ollama_adapter, &openai_adapter);
 
             // Auto-index if empty
             if (!storage.isIndexPopulated(db)) {
@@ -338,6 +340,47 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         }
     }
 
+    // Resolve embedding backend: CLI flag > env var > config > default (ollama)
+    const backend: config.EmbeddingBackend = if (parsed.embedding_backend) |b| b else blk: {
+        if (std.process.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_BACKEND")) |env_val| {
+            defer allocator.free(env_val);
+            break :blk config.EmbeddingBackend.parse(env_val) catch .ollama;
+        } else |_| {}
+        if (cfg.embedding_backend) |b| break :blk b;
+        break :blk .ollama;
+    };
+
+    // Resolve per-backend URL/model defaults
+    const default_url = switch (backend) {
+        .ollama => defaults.ollama_url,
+        .openai => defaults.openai_url,
+    };
+    const default_model = switch (backend) {
+        .ollama => defaults.ollama_model,
+        .openai => defaults.openai_model,
+    };
+
+    const embedding_url = parsed.embedding_url orelse cfg.embedding_url orelse switch (backend) {
+        .ollama => parsed.ollama_url orelse cfg.ollama_url orelse default_url,
+        .openai => default_url,
+    };
+    const embedding_model = parsed.embedding_model orelse cfg.embedding_model orelse switch (backend) {
+        .ollama => parsed.ollama_model orelse cfg.ollama_model orelse default_model,
+        .openai => default_model,
+    };
+
+    // Resolve API key: CLI flag > env var > config
+    var api_key: ?[]const u8 = null;
+    var api_key_owned = false;
+    if (parsed.embedding_api_key) |k| {
+        api_key = k;
+    } else if (std.process.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_API_KEY")) |env_val| {
+        api_key = env_val;
+        api_key_owned = true;
+    } else |_| {
+        if (cfg.embedding_api_key) |k| api_key = k;
+    }
+
     return Settings{
         .output = parsed.output,
         .top_n = if (parsed.seen.top_n) parsed.top_n else defaults.top_n,
@@ -347,6 +390,11 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         .conversation_dir_owned = conv_dir_owned,
         .ollama_url = parsed.ollama_url orelse cfg.ollama_url orelse defaults.ollama_url,
         .ollama_model = parsed.ollama_model orelse cfg.ollama_model orelse defaults.ollama_model,
+        .embedding_backend = backend,
+        .embedding_url = embedding_url,
+        .embedding_model = embedding_model,
+        .embedding_api_key = api_key,
+        .embedding_api_key_owned = api_key_owned,
         .embedding_dim = parsed.embedding_dim orelse cfg.embedding_dim orelse defaults.embedding_dim,
         .batch_size = defaults.batch_size,
         .search_mode = if (parsed.seen.search_mode) parsed.search_mode else defaults.search_mode,
@@ -360,6 +408,41 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         .llm_source = llm_source,
         .extra_dirs = try extra_dirs.toOwnedSlice(allocator),
     };
+}
+
+/// Build an Embedder for the configured backend, or return null if it's not
+/// available (Ollama not running, model loading, etc.). Adapter storage is
+/// provided by the caller so lifetimes match the HTTP client.
+fn setupEmbedder(
+    allocator: std.mem.Allocator,
+    http_client: *ollama.StdHttpTransport,
+    settings: Settings,
+    stderr: *std.Io.Writer,
+    ollama_adapter: *embedding.OllamaEmbedder,
+    openai_adapter: *embedding.OpenAIEmbedder,
+) ?embedding.Embedder {
+    switch (settings.embedding_backend) {
+        .ollama => {
+            if (!tryInitOllama(allocator, http_client, settings.embedding_url, settings.embedding_model, stderr)) {
+                return null;
+            }
+            ollama_adapter.* = .{
+                .transport = http_client.transport(),
+                .base_url = settings.embedding_url,
+                .model = settings.embedding_model,
+            };
+            return ollama_adapter.embedder();
+        },
+        .openai => {
+            openai_adapter.* = .{
+                .transport = http_client.transport(),
+                .base_url = settings.embedding_url,
+                .api_key = settings.embedding_api_key,
+                .model = settings.embedding_model,
+            };
+            return openai_adapter.embedder();
+        },
+    }
 }
 
 fn tryInitOllama(
