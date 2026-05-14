@@ -21,18 +21,30 @@
 					stripRoot = true;
 				};
 
-				sqlite-vec-src = pkgs.fetchgit {
-					url = "https://github.com/pmarreck/sqlite-vec.git";
-					rev = "742ac1607d5490c71758c9fde80820387391910d";
-					hash = "sha256-CFZAditwPGoWpAK7AG8BaxksfxjEzyGdlMvuZPsJ7CQ=";
-				};
+				# Fixed-output derivation that pre-fetches all Zig URL deps from
+				# build.zig.zon (sqlite_vec). Network access only here; the
+				# consumer build is fully offline.
+				# To recompute: set zigDepsHash = ""; nix build; copy printed hash.
+				zigDepsHash = "sha256-p/4X+fEseQN3WvyE6f7ASvCVN18+Ob+EZkkkgxqpSRk=";
 
-				zigPkgCache = pkgs.linkFarm "zig-pkg-cache" [
-					{
-						name = "sqlite_vec-0.1.7-alpha.2-4Cdt0OvwBACYsEQvfmbSw0sUHuXhcwD5PgjGyslHXU2q";
-						path = sqlite-vec-src;
-					}
-				];
+				zigDeps = pkgs.stdenv.mkDerivation {
+					pname = "chatscan-zig-deps";
+					version = "0.1.0";
+					src = ./.;
+					nativeBuildInputs = [ zigPkg pkgs.git pkgs.cacert ];
+					outputHashMode = "recursive";
+					outputHashAlgo = "sha256";
+					outputHash = zigDepsHash;
+					buildPhase = ''
+						export HOME=$TMPDIR
+						export ZIG_GLOBAL_CACHE_DIR=$out
+						export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+						export GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+						zig build --fetch=all
+					'';
+					dontInstall = true;
+					dontFixup = true;
+				};
 			in {
 				packages.default = pkgs.stdenv.mkDerivation {
 					pname = "chatscan";
@@ -46,13 +58,15 @@
 					dontFixup = true;
 
 					buildPhase = ''
+						export HOME=$TMPDIR
 						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
 						export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
 						export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
 						mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+						cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+						chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
 
 						zig build \
-							--system ${zigPkgCache} \
 							-Doptimize=ReleaseSafe \
 							--color off
 					'';
