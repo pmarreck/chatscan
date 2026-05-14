@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const runtime = @import("runtime.zig");
 
 pub const ParsedMessage = struct {
     role: []const u8,
@@ -207,7 +208,7 @@ fn detectProjectName(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
 }
 
 fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(runtime.io(), path, .{}) catch return false;
     return true;
 }
 
@@ -347,33 +348,33 @@ fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u
         files.deinit(allocator);
     }
 
-    var year_dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var year_dir = std.Io.Dir.cwd().openDir(runtime.io(), sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return files.toOwnedSlice(allocator),
         else => return err,
     };
-    defer year_dir.close();
+    defer year_dir.close(runtime.io());
 
     var year_iter = year_dir.iterate();
-    while (try year_iter.next()) |year_entry| {
+    while (try year_iter.next(runtime.io())) |year_entry| {
         if (year_entry.kind != .directory) continue;
-        var month_dir = year_dir.openDir(year_entry.name, .{ .iterate = true }) catch continue;
-        defer month_dir.close();
+        var month_dir = year_dir.openDir(runtime.io(), year_entry.name, .{ .iterate = true }) catch continue;
+        defer month_dir.close(runtime.io());
 
         var month_iter = month_dir.iterate();
-        while (try month_iter.next()) |month_entry| {
+        while (try month_iter.next(runtime.io())) |month_entry| {
             if (month_entry.kind != .directory) continue;
-            var day_dir = month_dir.openDir(month_entry.name, .{ .iterate = true }) catch continue;
-            defer day_dir.close();
+            var day_dir = month_dir.openDir(runtime.io(), month_entry.name, .{ .iterate = true }) catch continue;
+            defer day_dir.close(runtime.io());
 
             var day_iter = day_dir.iterate();
-            while (try day_iter.next()) |day_entry| {
+            while (try day_iter.next(runtime.io())) |day_entry| {
                 if (day_entry.kind != .directory) continue;
 
-                var file_dir = day_dir.openDir(day_entry.name, .{ .iterate = true }) catch continue;
-                defer file_dir.close();
+                var file_dir = day_dir.openDir(runtime.io(), day_entry.name, .{ .iterate = true }) catch continue;
+                defer file_dir.close(runtime.io());
 
                 var file_iter = file_dir.iterate();
-                while (try file_iter.next()) |file_entry| {
+                while (try file_iter.next(runtime.io())) |file_entry| {
                     if (file_entry.kind != .file) continue;
                     if (!std.mem.endsWith(u8, file_entry.name, ".jsonl")) continue;
 
@@ -397,25 +398,25 @@ fn findGeminiFiles(allocator: std.mem.Allocator, gemini_dir: []const u8) ![][]u8
         files.deinit(allocator);
     }
 
-    var top_dir = std.fs.openDirAbsolute(gemini_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var top_dir = std.Io.Dir.cwd().openDir(runtime.io(), gemini_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return files.toOwnedSlice(allocator),
         else => return err,
     };
-    defer top_dir.close();
+    defer top_dir.close(runtime.io());
 
     var top_iter = top_dir.iterate();
-    while (try top_iter.next()) |entry| {
+    while (try top_iter.next(runtime.io())) |entry| {
         if (entry.kind != .directory) continue;
 
         // Look for chats/ subdirectory
         const chats_path = std.fmt.allocPrint(allocator, "{s}/{s}/chats", .{ gemini_dir, entry.name }) catch continue;
         defer allocator.free(chats_path);
 
-        var chats_dir = std.fs.openDirAbsolute(chats_path, .{ .iterate = true }) catch continue;
-        defer chats_dir.close();
+        var chats_dir = std.Io.Dir.cwd().openDir(runtime.io(), chats_path, .{ .iterate = true }) catch continue;
+        defer chats_dir.close(runtime.io());
 
         var chat_iter = chats_dir.iterate();
-        while (try chat_iter.next()) |chat_entry| {
+        while (try chat_iter.next(runtime.io())) |chat_entry| {
             if (chat_entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, chat_entry.name, ".json")) continue;
 
@@ -448,22 +449,22 @@ pub fn findConversationFiles(allocator: std.mem.Allocator, conversation_dir: []c
         files.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(conversation_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(runtime.io(), conversation_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return files.toOwnedSlice(allocator),
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(runtime.io());
 
     // Walk all project subdirectories
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(runtime.io())) |entry| {
         if (entry.kind != .directory) continue;
 
-        var sub_dir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-        defer sub_dir.close();
+        var sub_dir = dir.openDir(runtime.io(), entry.name, .{ .iterate = true }) catch continue;
+        defer sub_dir.close(runtime.io());
 
         var sub_iter = sub_dir.iterate();
-        while (try sub_iter.next()) |sub_entry| {
+        while (try sub_iter.next(runtime.io())) |sub_entry| {
             if (sub_entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, sub_entry.name, ".jsonl")) continue;
 
@@ -476,17 +477,17 @@ pub fn findConversationFiles(allocator: std.mem.Allocator, conversation_dir: []c
         // Also check subagents/ subdirectories
         // Pattern: <uuid>/subagents/agent-<id>.jsonl
         var uuid_iter = sub_dir.iterate();
-        while (try uuid_iter.next()) |uuid_entry| {
+        while (try uuid_iter.next(runtime.io())) |uuid_entry| {
             if (uuid_entry.kind != .directory) continue;
 
-            var uuid_dir = sub_dir.openDir(uuid_entry.name, .{}) catch continue;
-            defer uuid_dir.close();
+            var uuid_dir = sub_dir.openDir(runtime.io(), uuid_entry.name, .{}) catch continue;
+            defer uuid_dir.close(runtime.io());
 
-            var subagent_dir = uuid_dir.openDir("subagents", .{ .iterate = true }) catch continue;
-            defer subagent_dir.close();
+            var subagent_dir = uuid_dir.openDir(runtime.io(), "subagents", .{ .iterate = true }) catch continue;
+            defer subagent_dir.close(runtime.io());
 
             var sa_iter = subagent_dir.iterate();
-            while (try sa_iter.next()) |sa_entry| {
+            while (try sa_iter.next(runtime.io())) |sa_entry| {
                 if (sa_entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, sa_entry.name, ".jsonl")) continue;
 

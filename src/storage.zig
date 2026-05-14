@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 const c = @cImport({
     @cDefine("SQLITE_VEC_STATIC", "1");
@@ -495,7 +496,7 @@ fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
     if (msg != null) {
         const msg_slice = std.mem.span(msg);
         var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
+        var w = std.Io.File.stderr().writer(runtime.io(), &buf);
         const stderr = &w.interface;
         _ = stderr.print("sqlite error ({s}): {s}\n", .{ context, msg_slice }) catch {};
         _ = stderr.flush() catch {};

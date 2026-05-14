@@ -187,7 +187,8 @@ fn isNameChar(c: u8) bool {
 }
 
 fn getEnvVar(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, name);
+    const runtime = @import("runtime.zig");
+    return runtime.getEnvVarOwned(allocator, name);
 }
 
 /// Returns true if the string contains any `$VAR` or `${VAR}` reference

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 pub const RgMatch = struct {
     file_path: []const u8,
@@ -40,20 +41,21 @@ pub fn searchRegex(
     try args.append(allocator, pattern);
     try args.append(allocator, conversation_dir);
 
-    var child = std.process.Child.init(args.items, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
+    const io = runtime.io();
+    var child = try std.process.spawn(io, .{
+        .argv = args.items,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
 
     // Allow up to 100MB
-    const output = try child.stdout.?.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    const output = try runtime.readToEndAlloc(child.stdout.?, allocator, 100 * 1024 * 1024);
     defer allocator.free(output);
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     // rg returns 1 for no matches, 2+ for errors
     switch (term) {
-        .Exited => |code| if (code > 1) return error.RipgrepFailed,
+        .exited => |code| if (code > 1) return error.RipgrepFailed,
         else => return error.RipgrepFailed,
     }
 

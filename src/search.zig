@@ -2,6 +2,7 @@ const std = @import("std");
 const storage = @import("storage.zig");
 const embedding = @import("embedding.zig");
 const simd = @import("simd.zig");
+const runtime = @import("runtime.zig");
 
 const sqlite = storage.sqlite;
 
@@ -151,7 +152,7 @@ pub fn search(
     }
 
     // Score and sort
-    const now_epoch = std.time.timestamp();
+    const now_epoch: i64 = @intCast(@divFloor(std.Io.Timestamp.now(runtime.io(), .real).nanoseconds, std.time.ns_per_s));
     for (results.items) |*res| {
         const vec_score: f32 = if (res.distance >= 0) 1.0 / (1.0 + res.distance) else 0;
         const lex_score: f32 = res.lexical;
@@ -529,7 +530,7 @@ test "parseIso8601 basic" {
 }
 
 test "computeRecencyScore recent is high" {
-    const now = std.time.timestamp();
+    const now: i64 = @intCast(@divFloor(std.Io.Timestamp.now(runtime.io(), .real).nanoseconds, std.time.ns_per_s));
     _ = now;
     // A message from "now" should score ~1.0
     const score_recent = computeRecencyScore("2026-03-07T12:00:00Z", parseIso8601("2026-03-07T12:00:00Z").?);

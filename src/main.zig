@@ -10,6 +10,7 @@ const output = @import("output.zig");
 const ripgrep = @import("ripgrep.zig");
 const conversation = @import("conversation.zig");
 const rename_mod = @import("rename.zig");
+const runtime = @import("runtime.zig");
 
 const version = "0.1.0";
 
@@ -60,20 +61,20 @@ const Settings = struct {
     };
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    runtime.init(init.io, init.environ_map);
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const arena = init.arena;
+    const allocator = arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
     var parsed = cli.parse(allocator, args) catch |err| {
@@ -276,7 +277,7 @@ pub fn main() !void {
             });
             defer search_mod.freeResults(allocator, sr.results);
 
-            const use_color = parsed.output != .json and std.process.getEnvVarOwned(allocator, "NO_COLOR") == error.EnvironmentVariableNotFound;
+            const use_color = parsed.output != .json and runtime.getEnvVarOwned(allocator, "NO_COLOR") == error.EnvironmentVariableNotFound;
 
             try output.writeResults(allocator, db, stdout, settings.output, sr.results, .{
                 .use_color = use_color,
@@ -294,7 +295,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
 
     // Resolve LLM source: CLI flag > env var > auto-detect
     const llm_source = if (parsed.llm_source) |llm| llm else blk: {
-        if (std.process.getEnvVarOwned(allocator, "CHATSCAN_LLM")) |env_val| {
+        if (runtime.getEnvVarOwned(allocator, "CHATSCAN_LLM")) |env_val| {
             defer allocator.free(env_val);
             break :blk config.LlmSource.parse(env_val) catch .claude;
         } else |_| {}
@@ -332,7 +333,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         const other_sources = [_]config.LlmSource{ .codex, .gemini };
         for (other_sources) |src| {
             const dir = config.defaultConversationDirForLlm(allocator, src) catch continue;
-            std.fs.accessAbsolute(dir, .{}) catch {
+            std.Io.Dir.cwd().access(runtime.io(), dir, .{}) catch {
                 allocator.free(dir);
                 continue;
             };
@@ -342,7 +343,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
 
     // Resolve embedding backend: CLI flag > env var > config > default (ollama)
     const backend: config.EmbeddingBackend = if (parsed.embedding_backend) |b| b else blk: {
-        if (std.process.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_BACKEND")) |env_val| {
+        if (runtime.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_BACKEND")) |env_val| {
             defer allocator.free(env_val);
             break :blk config.EmbeddingBackend.parse(env_val) catch .ollama;
         } else |_| {}
@@ -374,7 +375,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
     var api_key_owned = false;
     if (parsed.embedding_api_key) |k| {
         api_key = k;
-    } else if (std.process.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_API_KEY")) |env_val| {
+    } else if (runtime.getEnvVarOwned(allocator, "CHATSCAN_EMBEDDING_API_KEY")) |env_val| {
         api_key = env_val;
         api_key_owned = true;
     } else |_| {
@@ -479,7 +480,7 @@ fn runRegexSearch(
     _ = stderr;
     const matches = ripgrep.searchRegex(allocator, pattern, settings.conversation_dir, settings.top_n * 5) catch |err| {
         var buf: [256]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
+        var w = std.Io.File.stderr().writer(runtime.io(), &buf);
         const ew = &w.interface;
         _ = ew.print("error: ripgrep search failed: {}\n", .{err}) catch {};
         _ = ew.flush() catch {};
@@ -498,7 +499,7 @@ fn runRegexSearch(
         return;
     }
 
-    const use_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") == error.EnvironmentVariableNotFound;
+    const use_color = runtime.getEnvVarOwned(allocator, "NO_COLOR") == error.EnvironmentVariableNotFound;
 
     for (matches, 0..) |match, idx| {
         if (idx >= settings.top_n) break;
@@ -529,7 +530,7 @@ fn runRegexSearch(
 /// Detect the current project's conversation directory slug by matching the cwd
 /// to known project directories in the conversation dir.
 fn detectCurrentProjectDir(allocator: std.mem.Allocator, conversation_dir: []const u8) !?[]u8 {
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(runtime.io(), ".", allocator);
     defer allocator.free(cwd);
 
     // Convert cwd to the project directory slug format: replace / with -
@@ -543,7 +544,7 @@ fn detectCurrentProjectDir(allocator: std.mem.Allocator, conversation_dir: []con
     const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ conversation_dir, slug });
     defer allocator.free(full_path);
 
-    std.fs.accessAbsolute(full_path, .{}) catch {
+    std.Io.Dir.cwd().access(runtime.io(), full_path, .{}) catch {
         allocator.free(slug);
         return null;
     };
@@ -570,7 +571,7 @@ fn handleRename(
         std.process.exit(64);
     };
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(runtime.io(), ".", allocator);
     defer allocator.free(cwd);
 
     const old_path = try rename_mod.resolvePath(allocator, old_arg, cwd);
@@ -586,19 +587,19 @@ fn handleRename(
     defer allocator.free(new_path);
 
     // Validate old path exists
-    std.fs.accessAbsolute(old_path, .{}) catch {
+    std.Io.Dir.cwd().access(runtime.io(), old_path, .{}) catch {
         try stdout.print("error: old path does not exist: {s}\n", .{old_path});
         try stdout.flush();
         std.process.exit(1);
     };
 
     // Validate new path doesn't exist
-    std.fs.accessAbsolute(new_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(runtime.io(), new_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {}, // good
         else => {},
     };
     // If new path exists, error
-    if (std.fs.accessAbsolute(new_path, .{})) |_| {
+    if (std.Io.Dir.cwd().access(runtime.io(), new_path, .{})) |_| {
         try stdout.print("error: new path already exists: {s}\n", .{new_path});
         try stdout.flush();
         std.process.exit(1);
@@ -649,13 +650,13 @@ fn handleRename(
 
 fn ensureDbDir(allocator: std.mem.Allocator, db_path: []const u8) !void {
     if (std.fs.path.dirname(db_path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDirPath(runtime.io(), dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
                 // Try creating parent directories
                 const parent = try allocator.dupe(u8, dir);
                 defer allocator.free(parent);
-                std.fs.makeDirAbsolute(parent) catch {};
+                std.Io.Dir.cwd().createDirPath(runtime.io(), parent) catch {};
             },
         };
     }
@@ -707,6 +708,6 @@ fn printUsage(writer: *std.Io.Writer) !void {
 
 test "printUsage does not crash" {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
     try printUsage(&w.interface);
 }

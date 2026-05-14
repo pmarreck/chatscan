@@ -6,11 +6,11 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "vendor-sqlite-vec",
     },
     .dependencies = .{
         .sqlite_vec = .{
-            .path = "vendor-sqlite-vec",
+            .url = "git+https://github.com/pmarreck/sqlite-vec.git#c9d3630f56637276829d9ab0c54b1116c6d3e2ef",
+            .hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0CTyBADFzDhhNOTSAUplRsfH1qs-DqwP6FwrZ641",
         },
     },
     .fingerprint = 0xa9128cf17a7bf7ed,
