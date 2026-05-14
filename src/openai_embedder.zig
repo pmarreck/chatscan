@@ -66,7 +66,7 @@ fn sendAndParse(
 
 pub fn buildEmbedUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
     // Handle both "http://host:port" and "http://host:port/v1" as base_url
-    const stripped = std.mem.trimRight(u8, base_url, "/");
+    const stripped = std.mem.trimEnd(u8, base_url, "/");
     if (std.mem.endsWith(u8, stripped, "/v1")) {
         return std.fmt.allocPrint(allocator, "{s}/embeddings", .{stripped});
     }
@@ -78,7 +78,7 @@ pub fn buildEmbedRequest(
     model: []const u8,
     inputs: []const []const u8,
 ) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
 

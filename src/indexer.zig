@@ -75,9 +75,9 @@ pub fn indexAllForLlm(
     defer on_disk.deinit();
 
     // Embedding batch buffers
-    var embed_texts = std.ArrayListUnmanaged([]const u8){};
+    var embed_texts = std.ArrayListUnmanaged([]const u8).empty;
     defer embed_texts.deinit(allocator);
-    var embed_rowids = std.ArrayListUnmanaged(i64){};
+    var embed_rowids = std.ArrayListUnmanaged(i64).empty;
     defer embed_rowids.deinit(allocator);
 
     for (files) |file_path| {

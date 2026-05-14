@@ -5,3 +5,4 @@
 .zig-cache
 result
 inbox
+/zig-pkg/

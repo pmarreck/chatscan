@@ -98,7 +98,7 @@ fn extractTextContent(allocator: std.mem.Allocator, content_val: std.json.Value)
     switch (content_val) {
         .string => |s| return allocator.dupe(u8, s),
         .array => |arr| {
-            var parts = std.ArrayListUnmanaged([]const u8){};
+            var parts = std.ArrayListUnmanaged([]const u8).empty;
             defer parts.deinit(allocator);
 
             for (arr.items) |item| {
@@ -145,7 +145,7 @@ fn extractTextContent(allocator: std.mem.Allocator, content_val: std.json.Value)
 fn extractGeminiTextContent(allocator: std.mem.Allocator, content_val: std.json.Value) ![]u8 {
     if (content_val != .array) return allocator.alloc(u8, 0);
 
-    var parts = std.ArrayListUnmanaged([]const u8){};
+    var parts = std.ArrayListUnmanaged([]const u8).empty;
     defer parts.deinit(allocator);
 
     for (content_val.array.items) |item_val| {
@@ -265,7 +265,7 @@ pub fn parseCodexLine(allocator: std.mem.Allocator, line: []const u8, line_numbe
 /// Parse Gemini messages from a JSON session file.
 /// Returns all user/gemini messages from the file.
 pub fn parseGeminiFile(allocator: std.mem.Allocator, content: []const u8, project_dir: []const u8) ![]ParsedMessage {
-    var messages = std.ArrayListUnmanaged(ParsedMessage){};
+    var messages = std.ArrayListUnmanaged(ParsedMessage).empty;
     errdefer {
         for (messages.items) |*m| m.deinit(allocator);
         messages.deinit(allocator);
@@ -341,7 +341,7 @@ pub fn findConversationFilesForLlm(allocator: std.mem.Allocator, conversation_di
 
 /// Find Codex session files: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u8 {
-    var files = std.ArrayListUnmanaged([]u8){};
+    var files = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);
@@ -391,7 +391,7 @@ fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u
 
 /// Find Gemini chat files: ~/.gemini/tmp/*/chats/session-*.json
 fn findGeminiFiles(allocator: std.mem.Allocator, gemini_dir: []const u8) ![][]u8 {
-    var files = std.ArrayListUnmanaged([]u8){};
+    var files = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);
@@ -442,7 +442,7 @@ pub fn extractProjectDir(file_path: []const u8) []const u8 {
 
 /// Find all .jsonl conversation files in the conversation directory.
 pub fn findConversationFiles(allocator: std.mem.Allocator, conversation_dir: []const u8) ![][]u8 {
-    var files = std.ArrayListUnmanaged([]u8){};
+    var files = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);

@@ -327,7 +327,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
     }
 
     // For --all-llms, build extra dirs for the other LLM sources
-    var extra_dirs = std.ArrayListUnmanaged(Settings.ExtraDir){};
+    var extra_dirs = std.ArrayListUnmanaged(Settings.ExtraDir).empty;
     if (llm_source == .all) {
         const other_sources = [_]config.LlmSource{ .codex, .gemini };
         for (other_sources) |src| {

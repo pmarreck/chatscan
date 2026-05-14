@@ -84,7 +84,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
     var parsed = Parsed{};
     if (args.len <= 1) return parsed;
 
-    var query_parts = std.ArrayListUnmanaged([]const u8){};
+    var query_parts = std.ArrayListUnmanaged([]const u8).empty;
     defer query_parts.deinit(allocator);
 
     var i: usize = 1;

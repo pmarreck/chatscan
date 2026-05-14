@@ -4,12 +4,17 @@
 	inputs = {
 		nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 		flake-utils.url = "github:numtide/flake-utils";
+		zig-overlay = {
+			url = "github:mitchellh/zig-overlay";
+			inputs.nixpkgs.follows = "nixpkgs";
+		};
 	};
 
-	outputs = { self, nixpkgs, flake-utils }:
+	outputs = { self, nixpkgs, flake-utils, zig-overlay }:
 		flake-utils.lib.eachDefaultSystem (system:
 			let
 				pkgs = import nixpkgs { inherit system; };
+				zigPkg = zig-overlay.packages.${system}."0.16.0";
 				sqlite-amalgamation = pkgs.fetchzip {
 					url = "https://www.sqlite.org/2024/sqlite-amalgamation-3450300.zip";
 					sha256 = "sha256-F50oTmmcPIl0AZJbsWAR3tbNAPV3pQLf+CNITzhmXfI=";
@@ -35,7 +40,7 @@
 
 					src = ./.;
 
-					nativeBuildInputs = [ pkgs.zig_0_15 ];
+					nativeBuildInputs = [ zigPkg ];
 
 					dontConfigure = true;
 					dontFixup = true;
@@ -66,10 +71,10 @@
 				};
 
 				devShells.default = pkgs.mkShell {
-					packages = with pkgs; [
-						zig_0_15
-						jq
-						ripgrep
+					packages = [
+						zigPkg
+						pkgs.jq
+						pkgs.ripgrep
 					];
 					shellHook = ''
 						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"

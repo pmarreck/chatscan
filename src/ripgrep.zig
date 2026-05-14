@@ -18,7 +18,7 @@ pub fn searchRegex(
     conversation_dir: []const u8,
     max_results: usize,
 ) ![]RgMatch {
-    var args = std.ArrayListUnmanaged([]const u8){};
+    var args = std.ArrayListUnmanaged([]const u8).empty;
     defer args.deinit(allocator);
 
     try args.append(allocator, "rg");
@@ -61,7 +61,7 @@ pub fn searchRegex(
 }
 
 fn parseRgOutput(allocator: std.mem.Allocator, output: []const u8, max_results: usize) ![]RgMatch {
-    var matches = std.ArrayListUnmanaged(RgMatch){};
+    var matches = std.ArrayListUnmanaged(RgMatch).empty;
     errdefer {
         for (matches.items) |*m| m.deinit(allocator);
         matches.deinit(allocator);

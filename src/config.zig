@@ -42,7 +42,7 @@ pub const Config = struct {
     // Raw pre-expansion value for embedding_api_key, used to preserve ${VAR}
     // placeholders when rewriting the config file.
     embedding_api_key_raw: ?[]const u8 = null,
-    owned_strings: std.ArrayListUnmanaged([]u8) = .{},
+    owned_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         for (self.owned_strings.items) |s| allocator.free(s);

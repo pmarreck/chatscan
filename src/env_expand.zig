@@ -17,7 +17,7 @@ pub const MAX_EXPANSION_DEPTH: u8 = 10;
 ///
 /// Returns an owned slice. Caller frees.
 pub fn expandEnvVars(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try expandInto(allocator, &out, input, 0);
     return out.toOwnedSlice(allocator);

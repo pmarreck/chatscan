@@ -76,7 +76,7 @@ pub fn buildEmbedRequest(
 ) ![]u8 {
 	// Manual JSON construction — Zig 0.15's auto-serializer encodes []const u8
 	// inside []const []const u8 as byte arrays [84,104,...] instead of strings.
-	var out: std.io.Writer.Allocating = .init(allocator);
+	var out: std.Io.Writer.Allocating = .init(allocator);
 	defer out.deinit();
 	const w = &out.writer;
 

@@ -71,7 +71,7 @@ pub fn search(
         weight_recency /= sum;
     }
 
-    var results = std.ArrayListUnmanaged(Result){};
+    var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
         for (results.items) |*res| res.deinit(allocator);
         results.deinit(allocator);
@@ -123,7 +123,7 @@ pub fn search(
 
     // Apply filters
     if (options.role_filter != null or options.project_filter != null or options.project_dir_filter != null) {
-        var filtered = std.ArrayListUnmanaged(Result){};
+        var filtered = std.ArrayListUnmanaged(Result).empty;
         for (results.items) |res| {
             var keep = true;
             if (options.role_filter) |role| {
@@ -225,7 +225,7 @@ fn vectorCandidates(
     storage.bindTextPub(s, 1, json);
     _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
 
-    var results = std.ArrayListUnmanaged(Result){};
+    var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
         for (results.items) |*res| res.deinit(allocator);
         results.deinit(allocator);
@@ -301,7 +301,7 @@ fn ftsCandidates(
     storage.bindTextPub(s, 1, fts_query);
     _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
 
-    var results = std.ArrayListUnmanaged(Result){};
+    var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
         for (results.items) |*res| res.deinit(allocator);
         results.deinit(allocator);
@@ -362,7 +362,7 @@ fn likeCandidates(
     storage.bindTextPub(s, 1, like_pattern);
     _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
 
-    var results = std.ArrayListUnmanaged(Result){};
+    var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
         for (results.items) |*res| res.deinit(allocator);
         results.deinit(allocator);
@@ -394,7 +394,7 @@ fn likeCandidates(
 
 fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![:0]u8 {
     // Tokenize query and join with OR for broad matching
-    var tokens = std.ArrayListUnmanaged([]const u8){};
+    var tokens = std.ArrayListUnmanaged([]const u8).empty;
     defer tokens.deinit(allocator);
 
     var iter = std.mem.tokenizeAny(u8, query, " \t\n\r");
@@ -408,7 +408,7 @@ fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![:0]u8 {
         return allocPrintZ(allocator, "\"{s}\"", .{query});
     }
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
     for (tokens.items, 0..) |token, idx| {
@@ -430,7 +430,7 @@ fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
 }
 
 fn vectorToJson(allocator: std.mem.Allocator, vector: []const f32) ![:0]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("[");
     for (vector, 0..) |v, i| {

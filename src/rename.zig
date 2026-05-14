@@ -56,7 +56,7 @@ pub fn resolvePath(allocator: std.mem.Allocator, path: []const u8, cwd: []const 
 
 /// Normalize a path by resolving `.` and `..` components.
 fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var components = std.ArrayListUnmanaged([]const u8){};
+    var components = std.ArrayListUnmanaged([]const u8).empty;
     defer components.deinit(allocator);
 
     var iter = std.mem.splitScalar(u8, path, '/');
@@ -142,7 +142,7 @@ pub fn buildPlan(
     }
 
     // Codex discovery
-    var codex_files_list = std.ArrayListUnmanaged([]u8){};
+    var codex_files_list = std.ArrayListUnmanaged([]u8).empty;
     if (home) |h| {
         const sessions_dir = try std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{h});
         defer allocator.free(sessions_dir);
@@ -150,7 +150,7 @@ pub fn buildPlan(
     }
 
     // Gemini discovery
-    var gemini_dirs_list = std.ArrayListUnmanaged([]u8){};
+    var gemini_dirs_list = std.ArrayListUnmanaged([]u8).empty;
     if (home) |h| {
         const gemini_dir = try std.fmt.allocPrint(allocator, "{s}/.gemini/tmp", .{h});
         defer allocator.free(gemini_dir);
@@ -463,7 +463,7 @@ fn updateCodexFile(allocator: std.mem.Allocator, file_path: []const u8, old_path
 
     // Replace all occurrences of old_path with new_path in the content
     // This handles cwd fields in session_meta and any other path references
-    var output: std.io.Writer.Allocating = .init(allocator);
+    var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
 
     var pos: usize = 0;
