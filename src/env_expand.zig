@@ -17,7 +17,7 @@ pub const MAX_EXPANSION_DEPTH: u8 = 10;
 ///
 /// Returns an owned slice. Caller frees.
 pub fn expandEnvVars(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try expandInto(allocator, &out, input, 0);
     return out.toOwnedSlice(allocator);
@@ -187,7 +187,8 @@ fn isNameChar(c: u8) bool {
 }
 
 fn getEnvVar(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, name);
+    const runtime = @import("runtime.zig");
+    return runtime.getEnvVarOwned(allocator, name);
 }
 
 /// Returns true if the string contains any `$VAR` or `${VAR}` reference

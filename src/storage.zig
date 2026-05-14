@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 const c = @cImport({
     @cDefine("SQLITE_VEC_STATIC", "1");
@@ -281,7 +282,7 @@ pub fn getAllIndexedFiles(db: Db, allocator: std.mem.Allocator) ![]IndexedFile {
     defer _ = c.sqlite3_finalize(stmt);
     const s = stmt.?;
 
-    var list = std.ArrayListUnmanaged(IndexedFile){};
+    var list = std.ArrayListUnmanaged(IndexedFile).empty;
     errdefer {
         for (list.items) |*item| item.deinit(allocator);
         list.deinit(allocator);
@@ -474,7 +475,7 @@ fn upsertMeta(db: Db, key: []const u8, value: []const u8) !void {
 }
 
 fn vectorToJson(allocator: std.mem.Allocator, vector: []const f32) ![:0]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("[");
     for (vector, 0..) |v, i| {
@@ -495,7 +496,7 @@ fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
     if (msg != null) {
         const msg_slice = std.mem.span(msg);
         var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
+        var w = std.Io.File.stderr().writer(runtime.io(), &buf);
         const stderr = &w.interface;
         _ = stderr.print("sqlite error ({s}): {s}\n", .{ context, msg_slice }) catch {};
         _ = stderr.flush() catch {};

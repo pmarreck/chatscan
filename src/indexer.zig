@@ -3,6 +3,7 @@ const storage = @import("storage.zig");
 const conversation = @import("conversation.zig");
 const embedding = @import("embedding.zig");
 const config = @import("config.zig");
+const runtime = @import("runtime.zig");
 
 pub const IndexStats = struct {
     files_scanned: usize = 0,
@@ -75,19 +76,19 @@ pub fn indexAllForLlm(
     defer on_disk.deinit();
 
     // Embedding batch buffers
-    var embed_texts = std.ArrayListUnmanaged([]const u8){};
+    var embed_texts = std.ArrayListUnmanaged([]const u8).empty;
     defer embed_texts.deinit(allocator);
-    var embed_rowids = std.ArrayListUnmanaged(i64){};
+    var embed_rowids = std.ArrayListUnmanaged(i64).empty;
     defer embed_rowids.deinit(allocator);
 
     for (files) |file_path| {
         try on_disk.put(file_path, {});
 
         // Get file mtime
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
-        const stat = file.stat() catch continue;
-        const mtime: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+        const file = std.Io.Dir.cwd().openFile(runtime.io(), file_path, .{}) catch continue;
+        defer file.close(runtime.io());
+        const stat = file.stat(runtime.io()) catch continue;
+        const mtime: i64 = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
 
         // Check if file needs indexing
         var start_line: i64 = 0;
@@ -273,11 +274,11 @@ fn flushEmbeddingBatch(
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const stat = try file.stat();
+    const file = try std.Io.Dir.cwd().openFile(runtime.io(), path, .{});
+    defer file.close(runtime.io());
+    const stat = try file.stat(runtime.io());
     if (stat.size > 100 * 1024 * 1024) return error.FileTooLarge; // 100MB cap
-    return file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    return runtime.readToEndAlloc(file, allocator, 100 * 1024 * 1024);
 }
 
 test "indexAll with empty dir" {
@@ -289,7 +290,7 @@ test "indexAll with empty dir" {
     defer result.deinit(allocator);
 
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
 
     const stats = try indexAll(allocator, db, "/tmp/nonexistent-chatscan-test-dir", null, 16, false, &w.interface);
     try std.testing.expectEqual(@as(usize, 0), stats.files_scanned);

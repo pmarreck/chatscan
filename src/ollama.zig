@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 pub const HttpRequest = struct {
 	method: []const u8,
@@ -76,7 +77,7 @@ pub fn buildEmbedRequest(
 ) ![]u8 {
 	// Manual JSON construction — Zig 0.15's auto-serializer encodes []const u8
 	// inside []const []const u8 as byte arrays [84,104,...] instead of strings.
-	var out: std.io.Writer.Allocating = .init(allocator);
+	var out: std.Io.Writer.Allocating = .init(allocator);
 	defer out.deinit();
 	const w = &out.writer;
 
@@ -246,7 +247,7 @@ pub const StdHttpTransport = struct {
 	client: std.http.Client,
 
 	pub fn init(allocator: std.mem.Allocator) StdHttpTransport {
-		return .{ .client = .{ .allocator = allocator } };
+		return .{ .client = .{ .allocator = allocator, .io = runtime.io() } };
 	}
 
 	pub fn deinit(self: *StdHttpTransport) void {
@@ -369,7 +370,7 @@ test "embed uses live Ollama" {
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
-	const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+	const value = runtime.getEnvVarOwned(allocator, key) catch |err| switch (err) {
 		error.EnvironmentVariableNotFound => return allocator.dupe(u8, fallback),
 		else => return err,
 	};

@@ -1,5 +1,6 @@
 const std = @import("std");
 const env_expand = @import("env_expand.zig");
+const runtime = @import("runtime.zig");
 
 pub const EmbeddingBackend = enum {
     ollama,
@@ -42,7 +43,7 @@ pub const Config = struct {
     // Raw pre-expansion value for embedding_api_key, used to preserve ${VAR}
     // placeholders when rewriting the config file.
     embedding_api_key_raw: ?[]const u8 = null,
-    owned_strings: std.ArrayListUnmanaged([]u8) = .{},
+    owned_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         for (self.owned_strings.items) |s| allocator.free(s);
@@ -52,7 +53,7 @@ pub const Config = struct {
 
 /// Return the XDG config directory for chatscan.
 pub fn configDir(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
+    if (runtime.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
         defer allocator.free(xdg);
         return std.fmt.allocPrint(allocator, "{s}/chatscan", .{xdg});
     } else |_| {}
@@ -63,7 +64,7 @@ pub fn configDir(allocator: std.mem.Allocator) ![]u8 {
 
 /// Return the XDG data directory for chatscan.
 pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME")) |xdg| {
+    if (runtime.getEnvVarOwned(allocator, "XDG_DATA_HOME")) |xdg| {
         defer allocator.free(xdg);
         return std.fmt.allocPrint(allocator, "{s}/chatscan", .{xdg});
     } else |_| {}
@@ -101,7 +102,7 @@ pub fn detectDefaultLlm(allocator: std.mem.Allocator) !LlmSource {
     for (sources) |llm| {
         const dir = try defaultConversationDirForLlm(allocator, llm);
         defer allocator.free(dir);
-        std.fs.accessAbsolute(dir, .{}) catch continue;
+        std.Io.Dir.cwd().access(runtime.io(), dir, .{}) catch continue;
         return llm;
     }
     return .claude; // fallback
@@ -114,13 +115,13 @@ pub fn loadConfig(allocator: std.mem.Allocator) !Config {
     const path = try std.fmt.allocPrint(allocator, "{s}/config", .{cd});
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.cwd().openFile(runtime.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return Config{},
         else => return err,
     };
-    defer file.close();
+    defer file.close(runtime.io());
 
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return Config{};
+    const content = runtime.readToEndAlloc(file, allocator, 64 * 1024) catch return Config{};
     defer allocator.free(content);
 
     return parseConfig(allocator, content);
@@ -181,7 +182,7 @@ fn storeExpanded(
 }
 
 fn getHome(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+    return runtime.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

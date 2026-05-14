@@ -74,6 +74,6 @@ fn linkCommon(
     sqlite3_lib: *std.Build.Step.Compile,
     vec_static_lib: *std.Build.Step.Compile,
 ) void {
-    compile.linkLibrary(sqlite3_lib);
-    compile.linkLibrary(vec_static_lib);
+    compile.root_module.linkLibrary(sqlite3_lib);
+    compile.root_module.linkLibrary(vec_static_lib);
 }

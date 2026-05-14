@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const storage = @import("storage.zig");
+const runtime = @import("runtime.zig");
 
 /// Summary of what the rename will do, for confirmation display.
 pub const RenamePlan = struct {
@@ -56,7 +57,7 @@ pub fn resolvePath(allocator: std.mem.Allocator, path: []const u8, cwd: []const 
 
 /// Normalize a path by resolving `.` and `..` components.
 fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var components = std.ArrayListUnmanaged([]const u8){};
+    var components = std.ArrayListUnmanaged([]const u8).empty;
     defer components.deinit(allocator);
 
     var iter = std.mem.splitScalar(u8, path, '/');
@@ -111,7 +112,7 @@ pub fn buildPlan(
     new_path: []const u8,
     db: ?storage.Db,
 ) !RenamePlan {
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(runtime.io(), ".", allocator);
     defer allocator.free(cwd);
 
     // Check if cwd is inside old_path
@@ -121,7 +122,7 @@ pub fn buildPlan(
     const old_slug = try pathToSlug(allocator, old_path);
     const new_slug = try pathToSlug(allocator, new_path);
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const home = runtime.getEnvVarOwned(allocator, "HOME") catch null;
     defer if (home) |h| allocator.free(h);
 
     var claude_old_dir: ?[]u8 = null;
@@ -142,7 +143,7 @@ pub fn buildPlan(
     }
 
     // Codex discovery
-    var codex_files_list = std.ArrayListUnmanaged([]u8){};
+    var codex_files_list = std.ArrayListUnmanaged([]u8).empty;
     if (home) |h| {
         const sessions_dir = try std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{h});
         defer allocator.free(sessions_dir);
@@ -150,7 +151,7 @@ pub fn buildPlan(
     }
 
     // Gemini discovery
-    var gemini_dirs_list = std.ArrayListUnmanaged([]u8){};
+    var gemini_dirs_list = std.ArrayListUnmanaged([]u8).empty;
     if (home) |h| {
         const gemini_dir = try std.fmt.allocPrint(allocator, "{s}/.gemini/tmp", .{h});
         defer allocator.free(gemini_dir);
@@ -317,9 +318,10 @@ pub fn confirmPrompt(writer: *std.Io.Writer) !bool {
     try writer.writeAll("Proceed? [y/N] ");
     try writer.flush();
 
-    const stdin = std.fs.File.stdin();
+    const stdin = std.Io.File.stdin();
     var buf: [16]u8 = undefined;
-    const n = stdin.read(&buf) catch return false;
+    var stdin_reader = stdin.reader(runtime.io(), &buf);
+    const n = stdin_reader.interface.readSliceShort(&buf) catch return false;
     if (n == 0) return false;
     const input = std.mem.trim(u8, buf[0..n], " \t\r\n");
     return input.len == 1 and (input[0] == 'y' or input[0] == 'Y');
@@ -328,16 +330,16 @@ pub fn confirmPrompt(writer: *std.Io.Writer) !bool {
 // ── Internal helpers ─────────────────────────────────────────────────
 
 fn dirExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(runtime.io(), path, .{}) catch return false;
     return true;
 }
 
 fn countFilesInDir(path: []const u8) usize {
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return 0;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(runtime.io(), path, .{ .iterate = true }) catch return 0;
+    defer dir.close(runtime.io());
     var count: usize = 0;
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(runtime.io()) catch null) |entry| {
         if (entry.kind == .file) count += 1;
     }
     return count;
@@ -345,10 +347,10 @@ fn countFilesInDir(path: []const u8) usize {
 
 fn checkLockFiles(allocator: std.mem.Allocator, claude_dir: []const u8) bool {
     // Check for any .lock files in the claude project dir
-    var dir = std.fs.openDirAbsolute(claude_dir, .{ .iterate = true }) catch return false;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(runtime.io(), claude_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(runtime.io());
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(runtime.io()) catch null) |entry| {
         if (std.mem.endsWith(u8, entry.name, ".lock")) return true;
     }
     _ = allocator;
@@ -362,29 +364,29 @@ fn findCodexFilesWithCwd(
     result: *std.ArrayListUnmanaged([]u8),
 ) !void {
     // Walk YYYY/MM/DD/*.jsonl and grep for session_meta with matching cwd
-    var year_dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch return;
-    defer year_dir.close();
+    var year_dir = std.Io.Dir.cwd().openDir(runtime.io(), sessions_dir, .{ .iterate = true }) catch return;
+    defer year_dir.close(runtime.io());
 
     var year_iter = year_dir.iterate();
-    while (try year_iter.next()) |ye| {
+    while (try year_iter.next(runtime.io())) |ye| {
         if (ye.kind != .directory) continue;
-        var month_dir = year_dir.openDir(ye.name, .{ .iterate = true }) catch continue;
-        defer month_dir.close();
+        var month_dir = year_dir.openDir(runtime.io(), ye.name, .{ .iterate = true }) catch continue;
+        defer month_dir.close(runtime.io());
 
         var month_iter = month_dir.iterate();
-        while (try month_iter.next()) |me| {
+        while (try month_iter.next(runtime.io())) |me| {
             if (me.kind != .directory) continue;
-            var day_dir = month_dir.openDir(me.name, .{ .iterate = true }) catch continue;
-            defer day_dir.close();
+            var day_dir = month_dir.openDir(runtime.io(), me.name, .{ .iterate = true }) catch continue;
+            defer day_dir.close(runtime.io());
 
             var day_iter = day_dir.iterate();
-            while (try day_iter.next()) |de| {
+            while (try day_iter.next(runtime.io())) |de| {
                 if (de.kind != .directory) continue;
-                var file_dir = day_dir.openDir(de.name, .{ .iterate = true }) catch continue;
-                defer file_dir.close();
+                var file_dir = day_dir.openDir(runtime.io(), de.name, .{ .iterate = true }) catch continue;
+                defer file_dir.close(runtime.io());
 
                 var file_iter = file_dir.iterate();
-                while (try file_iter.next()) |fe| {
+                while (try file_iter.next(runtime.io())) |fe| {
                     if (fe.kind != .file) continue;
                     if (!std.mem.endsWith(u8, fe.name, ".jsonl")) continue;
 
@@ -406,11 +408,12 @@ fn findCodexFilesWithCwd(
 
 fn fileContainsCwd(allocator: std.mem.Allocator, file_path: []const u8, target_cwd: []const u8) bool {
     // Read first few KB looking for session_meta with cwd
-    const file = std.fs.openFileAbsolute(file_path, .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(runtime.io(), file_path, .{}) catch return false;
+    defer file.close(runtime.io());
     // session_meta is always the first line
     var buf: [8192]u8 = undefined;
-    const n = file.read(&buf) catch return false;
+    var freader = file.reader(runtime.io(), &buf);
+    const n = freader.interface.readSliceShort(&buf) catch return false;
     if (n == 0) return false;
 
     // Quick check: does the first line contain the target path?
@@ -427,21 +430,22 @@ fn findGeminiDirsWithPath(
     old_path: []const u8,
     result: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    var dir = std.fs.openDirAbsolute(gemini_dir, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(runtime.io(), gemini_dir, .{ .iterate = true }) catch return;
+    defer dir.close(runtime.io());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(runtime.io())) |entry| {
         if (entry.kind != .directory) continue;
 
         const project_root_path = try std.fmt.allocPrint(allocator, "{s}/{s}/.project_root", .{ gemini_dir, entry.name });
         defer allocator.free(project_root_path);
 
-        const file = std.fs.openFileAbsolute(project_root_path, .{}) catch continue;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(runtime.io(), project_root_path, .{}) catch continue;
+        defer file.close(runtime.io());
 
         var buf: [4096]u8 = undefined;
-        const n = file.read(&buf) catch continue;
+        var freader = file.reader(runtime.io(), &buf);
+        const n = freader.interface.readSliceShort(&buf) catch continue;
         const content = std.mem.trim(u8, buf[0..n], " \t\r\n");
 
         if (std.mem.eql(u8, content, old_path)) {
@@ -453,17 +457,17 @@ fn findGeminiDirsWithPath(
 
 fn updateCodexFile(allocator: std.mem.Allocator, file_path: []const u8, old_path: []const u8, new_path: []const u8) !void {
     const content = blk: {
-        const file = try std.fs.openFileAbsolute(file_path, .{});
-        defer file.close();
-        const stat = try file.stat();
+        const file = try std.Io.Dir.cwd().openFile(runtime.io(), file_path, .{});
+        defer file.close(runtime.io());
+        const stat = try file.stat(runtime.io());
         if (stat.size > 200 * 1024 * 1024) return error.FileTooLarge;
-        break :blk try file.readToEndAlloc(allocator, 200 * 1024 * 1024);
+        break :blk try runtime.readToEndAlloc(file, allocator, 200 * 1024 * 1024);
     };
     defer allocator.free(content);
 
     // Replace all occurrences of old_path with new_path in the content
     // This handles cwd fields in session_meta and any other path references
-    var output: std.io.Writer.Allocating = .init(allocator);
+    var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
 
     var pos: usize = 0;
@@ -478,18 +482,18 @@ fn updateCodexFile(allocator: std.mem.Allocator, file_path: []const u8, old_path
     defer allocator.free(new_content);
 
     // Write back
-    const file = try std.fs.createFileAbsolute(file_path, .{});
-    defer file.close();
-    try file.writeAll(new_content);
+    const file = try std.Io.Dir.cwd().createFile(runtime.io(), file_path, .{});
+    defer file.close(runtime.io());
+    try file.writeStreamingAll(runtime.io(), new_content);
 }
 
 fn updateGeminiProjectRoot(allocator: std.mem.Allocator, dir_path: []const u8, new_path: []const u8) !void {
     const pr_path = try std.fmt.allocPrint(allocator, "{s}/.project_root", .{dir_path});
     defer allocator.free(pr_path);
 
-    const file = try std.fs.createFileAbsolute(pr_path, .{});
-    defer file.close();
-    try file.writeAll(new_path);
+    const file = try std.Io.Dir.cwd().createFile(runtime.io(), pr_path, .{});
+    defer file.close(runtime.io());
+    try file.writeStreamingAll(runtime.io(), new_path);
 }
 
 fn countMessagesWithSlug(db: storage.Db, slug: []const u8) i64 {
@@ -628,8 +632,8 @@ test "resolvePath absolute with dotdot" {
 }
 
 fn getTmpDir(allocator: std.mem.Allocator) []const u8 {
-    return std.process.getEnvVarOwned(allocator, "TMPDIR") catch
-        std.process.getEnvVarOwned(allocator, "TMP") catch "/tmp";
+    return runtime.getEnvVarOwned(allocator, "TMPDIR") catch
+        runtime.getEnvVarOwned(allocator, "TMP") catch "/tmp";
 }
 
 fn freeTmpDir(allocator: std.mem.Allocator, dir: []const u8) void {
@@ -644,21 +648,21 @@ test "updateCodexFile replaces cwd" {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-codex-rename.jsonl", .{tmpdir});
     defer allocator.free(tmp_path);
     {
-        const f = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), tmp_path, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(), 
             \\{"timestamp":"2026-03-06T23:05:09.184Z","type":"session_meta","payload":{"cwd":"/Users/test/old-project"}}
             \\{"timestamp":"2026-03-06T23:05:14.241Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}
             \\
         );
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(runtime.io(), tmp_path) catch {};
 
     try updateCodexFile(allocator, tmp_path, "/Users/test/old-project", "/Users/test/new-project");
 
-    const f = try std.fs.openFileAbsolute(tmp_path, .{});
-    defer f.close();
-    const content = try f.readToEndAlloc(allocator, 1024 * 1024);
+    const f = try std.Io.Dir.cwd().openFile(runtime.io(), tmp_path, .{});
+    defer f.close(runtime.io());
+    const content = try runtime.readToEndAlloc(f, allocator, 1024 * 1024);
     defer allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "/Users/test/new-project") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/Users/test/old-project") == null);
@@ -671,23 +675,24 @@ test "updateGeminiProjectRoot writes new path" {
 
     const tmp_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-gemini-rename", .{tmpdir});
     defer allocator.free(tmp_dir);
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), tmp_dir) catch {};
 
     const pr_path = try std.fmt.allocPrint(allocator, "{s}/.project_root", .{tmp_dir});
     defer allocator.free(pr_path);
     {
-        const f = try std.fs.createFileAbsolute(pr_path, .{});
-        defer f.close();
-        try f.writeAll("/Users/test/old-project");
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), pr_path, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(), "/Users/test/old-project");
     }
 
     try updateGeminiProjectRoot(allocator, tmp_dir, "/Users/test/new-project");
 
-    const f = try std.fs.openFileAbsolute(pr_path, .{});
-    defer f.close();
+    const f = try std.Io.Dir.cwd().openFile(runtime.io(), pr_path, .{});
+    defer f.close(runtime.io());
     var buf: [1024]u8 = undefined;
-    const n = try f.read(&buf);
+    var fr = f.reader(runtime.io(), &buf);
+    const n = try fr.interface.readSliceShort(&buf);
     try std.testing.expectEqualStrings("/Users/test/new-project", buf[0..n]);
 }
 
@@ -705,14 +710,14 @@ test "full rename flow with temp dirs" {
     const new_test_file = try std.fmt.allocPrint(allocator, "{s}/test.txt", .{new_dir});
     defer allocator.free(new_test_file);
 
-    std.fs.makeDirAbsolute(old_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(old_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(new_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), old_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), old_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), new_dir) catch {};
 
     {
-        const f = try std.fs.createFileAbsolute(test_file, .{});
-        defer f.close();
-        try f.writeAll("hello");
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), test_file, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(), "hello");
     }
 
     var plan = try buildPlan(allocator, old_dir, new_dir, null);
@@ -722,19 +727,20 @@ test "full rename flow with temp dirs" {
     try std.testing.expectEqualStrings(new_dir, plan.new_path);
 
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
     try executePlan(allocator, &plan, null, &w.interface);
 
     // Verify old dir is gone and new dir exists with the file
-    std.fs.accessAbsolute(old_dir, .{}) catch |err| {
+    std.Io.Dir.cwd().access(runtime.io(), old_dir, .{}) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
     };
-    std.fs.accessAbsolute(new_dir, .{}) catch {
+    std.Io.Dir.cwd().access(runtime.io(), new_dir, .{}) catch {
         return error.TestUnexpectedResult;
     };
-    const f = try std.fs.openFileAbsolute(new_test_file, .{});
-    defer f.close();
+    const f = try std.Io.Dir.cwd().openFile(runtime.io(), new_test_file, .{});
+    defer f.close(runtime.io());
     var read_buf: [64]u8 = undefined;
-    const n = try f.read(&read_buf);
+    var fr2 = f.reader(runtime.io(), &read_buf);
+    const n = try fr2.interface.readSliceShort(&read_buf);
     try std.testing.expectEqualStrings("hello", read_buf[0..n]);
 }

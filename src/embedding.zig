@@ -1,6 +1,7 @@
 const std = @import("std");
 const ollama = @import("ollama.zig");
 const openai_embedder = @import("openai_embedder.zig");
+const runtime = @import("runtime.zig");
 
 pub const Embedder = struct {
 	ctx: *anyopaque,
@@ -91,7 +92,7 @@ test "OllamaEmbedder uses live Ollama" {
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
-	const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+	const value = runtime.getEnvVarOwned(allocator, key) catch |err| switch (err) {
 		error.EnvironmentVariableNotFound => return allocator.dupe(u8, fallback),
 		else => return err,
 	};
