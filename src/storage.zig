@@ -443,14 +443,14 @@ fn bindInt(stmt: *c.sqlite3_stmt, index: c_int, value: i64) void {
     _ = c.sqlite3_bind_int64(stmt, index, value);
 }
 
-fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
+pub fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
     const ptr = c.sqlite3_column_text(stmt, col);
     if (ptr == null) return "";
     const len = c.sqlite3_column_bytes(stmt, col);
     return ptr[0..@intCast(len)];
 }
 
-fn columnTextOpt(stmt: *c.sqlite3_stmt, col: c_int) ?[]const u8 {
+pub fn columnTextOpt(stmt: *c.sqlite3_stmt, col: c_int) ?[]const u8 {
     const ptr = c.sqlite3_column_text(stmt, col);
     if (ptr == null) return null;
     const len = c.sqlite3_column_bytes(stmt, col);
@@ -474,7 +474,7 @@ fn upsertMeta(db: Db, key: []const u8, value: []const u8) !void {
     _ = c.sqlite3_step(stmt.?);
 }
 
-fn vectorToJson(allocator: std.mem.Allocator, vector: []const f32) ![:0]u8 {
+pub fn vectorToJson(allocator: std.mem.Allocator, vector: []const f32) ![:0]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("[");
@@ -505,6 +505,17 @@ fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Test helper: count rows in sqlite_master matching a given object name.
+fn objectCount(db: Db, name: [:0]const u8) i64 {
+    const sql = "SELECT COUNT(*) FROM sqlite_master WHERE name = ?";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return -1;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt.?, 1, name.ptr, -1, null);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(stmt.?, 0);
+}
+
 test "open in-memory db and init schema" {
     const allocator = std.testing.allocator;
     const db = try openMemoryWithVec(allocator);
@@ -512,6 +523,22 @@ test "open in-memory db and init schema" {
 
     var result = try initSchema(allocator, db, .{ .embedding_dim = 1024, .embedding_model = "bge-large" });
     defer result.deinit(allocator);
+
+    // The schema must actually exist — not merely have returned without error.
+    try std.testing.expectEqual(@as(i64, 1), objectCount(db, "messages"));
+    try std.testing.expectEqual(@as(i64, 1), objectCount(db, "indexed_files"));
+    try std.testing.expectEqual(@as(i64, 1), objectCount(db, "meta"));
+    try std.testing.expectEqual(@as(i64, 1), objectCount(db, "messages_fts"));
+    try std.testing.expectEqual(@as(i64, 1), objectCount(db, "embeddings"));
+
+    // Metadata rows should be populated from the Schema args.
+    const sql = "SELECT value FROM meta WHERE key = 'embedding_dim'";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt.?));
+    const dim_text = c.sqlite3_column_text(stmt.?, 0);
+    try std.testing.expectEqualStrings("1024", std.mem.span(dim_text));
 }
 
 test "insert and retrieve message" {

@@ -203,7 +203,7 @@ fn vectorCandidates(
     query_vec: []const f32,
     limit: usize,
 ) ![]Result {
-    const json = try vectorToJson(allocator, query_vec);
+    const json = try storage.vectorToJson(allocator, query_vec);
     defer allocator.free(json);
 
     const sql =
@@ -237,14 +237,14 @@ fn vectorCandidates(
             .id = sqlite.sqlite3_column_int64(s, 0),
             .message = .{
                 .id = sqlite.sqlite3_column_int64(s, 0),
-                .file_path = try allocator.dupe(u8, columnText(s, 1)),
+                .file_path = try allocator.dupe(u8, storage.columnText(s, 1)),
                 .line_number = sqlite.sqlite3_column_int64(s, 2),
-                .role = try allocator.dupe(u8, columnText(s, 3)),
-                .content = try allocator.dupe(u8, columnText(s, 4)),
-                .timestamp = if (columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
-                .session_id = if (columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
-                .project_name = if (columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
-                .project_dir = if (columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
+                .role = try allocator.dupe(u8, storage.columnText(s, 3)),
+                .content = try allocator.dupe(u8, storage.columnText(s, 4)),
+                .timestamp = if (storage.columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
+                .session_id = if (storage.columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
+                .project_name = if (storage.columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
+                .project_dir = if (storage.columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
             },
             .score = 0,
             .distance = @floatCast(sqlite.sqlite3_column_double(s, 9)),
@@ -317,14 +317,14 @@ fn ftsCandidates(
             .id = sqlite.sqlite3_column_int64(s, 0),
             .message = .{
                 .id = sqlite.sqlite3_column_int64(s, 0),
-                .file_path = try allocator.dupe(u8, columnText(s, 1)),
+                .file_path = try allocator.dupe(u8, storage.columnText(s, 1)),
                 .line_number = sqlite.sqlite3_column_int64(s, 2),
-                .role = try allocator.dupe(u8, columnText(s, 3)),
-                .content = try allocator.dupe(u8, columnText(s, 4)),
-                .timestamp = if (columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
-                .session_id = if (columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
-                .project_name = if (columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
-                .project_dir = if (columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
+                .role = try allocator.dupe(u8, storage.columnText(s, 3)),
+                .content = try allocator.dupe(u8, storage.columnText(s, 4)),
+                .timestamp = if (storage.columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
+                .session_id = if (storage.columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
+                .project_name = if (storage.columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
+                .project_dir = if (storage.columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
             },
             .score = 0,
             .distance = -1,
@@ -374,14 +374,14 @@ fn likeCandidates(
             .id = sqlite.sqlite3_column_int64(s, 0),
             .message = .{
                 .id = sqlite.sqlite3_column_int64(s, 0),
-                .file_path = try allocator.dupe(u8, columnText(s, 1)),
+                .file_path = try allocator.dupe(u8, storage.columnText(s, 1)),
                 .line_number = sqlite.sqlite3_column_int64(s, 2),
-                .role = try allocator.dupe(u8, columnText(s, 3)),
-                .content = try allocator.dupe(u8, columnText(s, 4)),
-                .timestamp = if (columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
-                .session_id = if (columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
-                .project_name = if (columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
-                .project_dir = if (columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
+                .role = try allocator.dupe(u8, storage.columnText(s, 3)),
+                .content = try allocator.dupe(u8, storage.columnText(s, 4)),
+                .timestamp = if (storage.columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
+                .session_id = if (storage.columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
+                .project_name = if (storage.columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
+                .project_dir = if (storage.columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
             },
             .score = 0,
             .distance = -1,
@@ -430,36 +430,7 @@ fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
     return allocator.dupeZ(u8, tmp);
 }
 
-fn vectorToJson(allocator: std.mem.Allocator, vector: []const f32) ![:0]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("[");
-    for (vector, 0..) |v, i| {
-        if (i > 0) try out.writer.writeAll(",");
-        try out.writer.print("{d}", .{v});
-    }
-    try out.writer.writeAll("]");
-    const slice = try out.toOwnedSlice();
-    const result = try allocator.allocSentinel(u8, slice.len, 0);
-    @memcpy(result, slice);
-    allocator.free(slice);
-    return result;
-}
 
-fn columnText(stmt: *sqlite.sqlite3_stmt, col: c_int) []const u8 {
-    const ptr = sqlite.sqlite3_column_text(stmt, col);
-    if (ptr == null) return "";
-    const len = sqlite.sqlite3_column_bytes(stmt, col);
-    return ptr[0..@intCast(len)];
-}
-
-fn columnTextOpt(stmt: *sqlite.sqlite3_stmt, col: c_int) ?[]const u8 {
-    const ptr = sqlite.sqlite3_column_text(stmt, col);
-    if (ptr == null) return null;
-    const len = sqlite.sqlite3_column_bytes(stmt, col);
-    if (len == 0) return null;
-    return ptr[0..@intCast(len)];
-}
 
 /// Compute a recency score from 0.0 (ancient) to 1.0 (now).
 /// Uses exponential decay with a half-life of 30 days.

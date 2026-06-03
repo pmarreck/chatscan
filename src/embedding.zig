@@ -67,9 +67,9 @@ test "OllamaEmbedder uses live Ollama" {
 	var transport = ollama.StdHttpTransport.init(allocator);
 	defer transport.deinit();
 
-	const url = try envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
+	const url = try runtime.envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
 	defer allocator.free(url);
-	const model = try envOrDefault(allocator, "OLLAMA_MODEL", "bge-large");
+	const model = try runtime.envOrDefault(allocator, "OLLAMA_MODEL", "bge-large");
 	defer allocator.free(model);
 
 	ollama.ensureModelAvailable(allocator, transport.transport(), url, model) catch |err| switch (err) {
@@ -91,10 +91,3 @@ test "OllamaEmbedder uses live Ollama" {
 	try std.testing.expect(embeddings[0].len > 0);
 }
 
-fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
-	const value = runtime.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-		error.EnvironmentVariableNotFound => return allocator.dupe(u8, fallback),
-		else => return err,
-	};
-	return value;
-}

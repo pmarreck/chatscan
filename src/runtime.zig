@@ -64,6 +64,15 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) GetEnvVarE
     return try allocator.dupe(u8, v);
 }
 
+/// Return an owned copy of env var `key`, or an owned copy of `fallback`
+/// when it is unset. Caller owns the returned slice.
+pub fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
+    return getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return allocator.dupe(u8, fallback),
+        else => return err,
+    };
+}
+
 /// 0.15-style shim for `file.readToEndAlloc(allocator, max)`.
 /// Returns owned slice limited to `max` bytes.
 pub fn readToEndAlloc(file: std.Io.File, allocator: std.mem.Allocator, max: usize) ![]u8 {

@@ -336,7 +336,7 @@ test "ensureModelAvailable reports missing model" {
 	var transport = StdHttpTransport.init(allocator);
 	defer transport.deinit();
 
-	const url = try envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
+	const url = try runtime.envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
 	defer allocator.free(url);
 
 	try std.testing.expectError(
@@ -352,9 +352,9 @@ test "embed uses live Ollama" {
 	var transport = StdHttpTransport.init(allocator);
 	defer transport.deinit();
 
-	const url = try envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
+	const url = try runtime.envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
 	defer allocator.free(url);
-	const model = try envOrDefault(allocator, "OLLAMA_MODEL", "bge-large");
+	const model = try runtime.envOrDefault(allocator, "OLLAMA_MODEL", "bge-large");
 	defer allocator.free(model);
 
 	ensureModelAvailable(allocator, transport.transport(), url, model) catch |err| switch (err) {
@@ -369,26 +369,23 @@ test "embed uses live Ollama" {
 	try std.testing.expect(embeddings[0].len > 0);
 }
 
-fn envOrDefault(allocator: std.mem.Allocator, key: []const u8, fallback: []const u8) ![]u8 {
-	const value = runtime.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-		error.EnvironmentVariableNotFound => return allocator.dupe(u8, fallback),
-		else => return err,
-	};
-	return value;
-}
 
 /// A mock transport for unit tests — returns canned responses based on URL path.
 const MockTransportCtx = struct {
 	tags_body: []const u8,
 	ps_body: []const u8,
 	embed_should_fail: bool = false,
+	tags_calls: usize = 0,
+	ps_calls: usize = 0,
 
 	fn send(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, req: HttpRequest) !HttpResponse {
 		const self: *MockTransportCtx = @ptrCast(@alignCast(ctx_ptr));
 		if (std.mem.endsWith(u8, req.url, "/api/tags")) {
+			self.tags_calls += 1;
 			return .{ .status = 200, .body = try allocator.dupe(u8, self.tags_body) };
 		}
 		if (std.mem.endsWith(u8, req.url, "/api/ps")) {
+			self.ps_calls += 1;
 			return .{ .status = 200, .body = try allocator.dupe(u8, self.ps_body) };
 		}
 		if (std.mem.endsWith(u8, req.url, "/api/embed")) {
@@ -466,6 +463,9 @@ test "ensureModelAvailable succeeds when model is loaded in ps" {
 		,
 	};
 	try ensureModelAvailable(allocator, mock.transport(), "http://localhost:11434", "bge-large");
+	// Success must mean it actually probed both endpoints, not short-circuited.
+	try std.testing.expectEqual(@as(usize, 1), mock.tags_calls);
+	try std.testing.expectEqual(@as(usize, 1), mock.ps_calls);
 }
 
 test "ensureModelAvailable returns ModelLoading when in tags but not ps and embed fails" {
@@ -511,7 +511,7 @@ test "buildPsUrl handles trailing slash" {
 
 /// Skip test if Ollama is not reachable (for CI environments without Ollama).
 pub fn skipIfNoOllama(allocator: std.mem.Allocator) !void {
-	const url = try envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
+	const url = try runtime.envOrDefault(allocator, "OLLAMA_URL", "http://localhost:11434");
 	defer allocator.free(url);
 
 	var transport = StdHttpTransport.init(allocator);

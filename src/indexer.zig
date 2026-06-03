@@ -10,6 +10,7 @@ pub const IndexStats = struct {
     files_indexed: usize = 0,
     messages_indexed: usize = 0,
     files_deleted: usize = 0,
+    embedding_failures: usize = 0,
 };
 
 pub fn indexAll(
@@ -140,7 +141,7 @@ pub fn indexAllForLlm(
                     try embed_rowids.append(allocator, rowid);
 
                     if (embed_texts.items.len >= batch_size) {
-                        try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+                        stats.embedding_failures += try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
                     }
                 }
 
@@ -188,7 +189,7 @@ pub fn indexAllForLlm(
                     try embed_rowids.append(allocator, rowid);
 
                     if (embed_texts.items.len >= batch_size) {
-                        try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+                        stats.embedding_failures += try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
                     }
                 }
 
@@ -216,14 +217,22 @@ pub fn indexAllForLlm(
 
     // Flush remaining embeddings
     if (embedder != null and embed_texts.items.len > 0) {
-        try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
+        stats.embedding_failures += try flushEmbeddingBatch(allocator, db, embedder.?, &embed_texts, &embed_rowids);
     }
 
     // Detect deleted files
     for (indexed) |item| {
         if (!on_disk.contains(item.file_path)) {
-            storage.deleteMessagesByFile(db, item.file_path) catch {};
-            storage.deleteIndexedFile(db, item.file_path) catch {};
+            storage.deleteMessagesByFile(db, item.file_path) catch |err| {
+                _ = stderr.print("warning: could not remove stale messages for {s}: {s}\n", .{ item.file_path, @errorName(err) }) catch {};
+                _ = stderr.flush() catch {};
+                continue;
+            };
+            storage.deleteIndexedFile(db, item.file_path) catch |err| {
+                _ = stderr.print("warning: could not remove stale index entry for {s}: {s}\n", .{ item.file_path, @errorName(err) }) catch {};
+                _ = stderr.flush() catch {};
+                continue;
+            };
             stats.files_deleted += 1;
         }
     }
@@ -231,6 +240,9 @@ pub fn indexAllForLlm(
     _ = stderr.print("Done: {d} files indexed, {d} messages, {d} files removed\n", .{
         stats.files_indexed, stats.messages_indexed, stats.files_deleted,
     }) catch {};
+    if (stats.embedding_failures > 0) {
+        _ = stderr.print("Warning: {d} embeddings failed to index; semantic search may miss these messages (keyword search unaffected)\n", .{stats.embedding_failures}) catch {};
+    }
     _ = stderr.flush() catch {};
 
     return stats;
@@ -242,35 +254,48 @@ fn flushEmbeddingBatch(
     embedder: embedding.Embedder,
     texts: *std.ArrayListUnmanaged([]const u8),
     rowids: *std.ArrayListUnmanaged(i64),
-) !void {
-    if (texts.items.len == 0) return;
+) !usize {
+    if (texts.items.len == 0) return 0;
+
+    // Number of inputs that ended up with no stored embedding (failed embed or insert).
+    var failures: usize = 0;
 
     const embeddings = embedder.embed(embedder.ctx, allocator, texts.items) catch {
         // Batch failed (e.g. one input exceeds context length) — retry individually
         for (texts.items, 0..) |text, idx| {
             const single = [_][]const u8{text};
             const single_emb = embedder.embed(embedder.ctx, allocator, &single) catch {
-                continue; // Skip this input
+                failures += 1; // Skip this input
+                continue;
             };
             defer embedder.free(embedder.ctx, allocator, single_emb);
             if (single_emb.len > 0) {
-                storage.insertEmbedding(db, allocator, rowids.items[idx], single_emb[0]) catch {};
+                storage.insertEmbedding(db, allocator, rowids.items[idx], single_emb[0]) catch {
+                    failures += 1;
+                };
+            } else {
+                failures += 1;
             }
         }
         for (texts.items) |t| allocator.free(t);
         texts.clearRetainingCapacity();
         rowids.clearRetainingCapacity();
-        return;
+        return failures;
     };
     defer embedder.free(embedder.ctx, allocator, embeddings);
 
     for (embeddings, 0..) |vec, idx| {
-        storage.insertEmbedding(db, allocator, rowids.items[idx], vec) catch {};
+        storage.insertEmbedding(db, allocator, rowids.items[idx], vec) catch {
+            failures += 1;
+        };
     }
+    // If the provider returned fewer vectors than inputs, the tail rows got nothing.
+    if (embeddings.len < rowids.items.len) failures += rowids.items.len - embeddings.len;
 
     for (texts.items) |t| allocator.free(t);
     texts.clearRetainingCapacity();
     rowids.clearRetainingCapacity();
+    return failures;
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -294,4 +319,144 @@ test "indexAll with empty dir" {
 
     const stats = try indexAll(allocator, db, "/tmp/nonexistent-chatscan-test-dir", null, 16, false, &w.interface);
     try std.testing.expectEqual(@as(usize, 0), stats.files_scanned);
+}
+
+// An embedder that always fails, to exercise the embedding-failure accounting path.
+const AlwaysFailEmbedder = struct {
+    fn embed(ctx: *anyopaque, allocator: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+        _ = ctx;
+        _ = allocator;
+        _ = inputs;
+        return error.EmbedUnavailable;
+    }
+    fn free(ctx: *anyopaque, allocator: std.mem.Allocator, embeddings: [][]f32) void {
+        _ = ctx;
+        _ = allocator;
+        _ = embeddings;
+    }
+};
+
+test "indexAll counts embedding failures without losing FTS indexing" {
+    const allocator = std.testing.allocator;
+
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const conv_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-idx-embedfail", .{tmpdir});
+    defer allocator.free(conv_dir);
+    const proj_dir = try std.fmt.allocPrint(allocator, "{s}/-Users-test-proj", .{conv_dir});
+    defer allocator.free(proj_dir);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/session.jsonl", .{proj_dir});
+    defer allocator.free(file_path);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), proj_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), file_path, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(),
+            \\{"type":"user","timestamp":"2026-03-06T12:00:00Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hello world"}]}}
+            \\{"type":"user","timestamp":"2026-03-06T12:00:01Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"second message"}]}}
+            \\
+        );
+    }
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var result = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer result.deinit(allocator);
+
+    var dummy: u8 = 0;
+    const embedder = embedding.Embedder{
+        .ctx = @ptrCast(&dummy),
+        .embed = AlwaysFailEmbedder.embed,
+        .free = AlwaysFailEmbedder.free,
+    };
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
+
+    const stats = try indexAll(allocator, db, conv_dir, embedder, 16, false, &w.interface);
+    // Both messages are still indexed for keyword search...
+    try std.testing.expectEqual(@as(usize, 2), stats.messages_indexed);
+    // ...but every embedding failed, and the user is told so via the counter.
+    try std.testing.expectEqual(@as(usize, 2), stats.embedding_failures);
+}
+
+
+// An embedder that returns correctly-sized vectors, to exercise the success path.
+const OkEmbedder = struct {
+    fn embed(ctx: *anyopaque, allocator: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+        _ = ctx;
+        const out = try allocator.alloc([]f32, inputs.len);
+        errdefer allocator.free(out);
+        for (out) |*v| {
+            v.* = try allocator.alloc(f32, 1024);
+            @memset(v.*, 0);
+            v.*[0] = 0.1;
+        }
+        return out;
+    }
+    fn free(ctx: *anyopaque, allocator: std.mem.Allocator, embeddings: [][]f32) void {
+        _ = ctx;
+        for (embeddings) |v| allocator.free(v);
+        allocator.free(embeddings);
+    }
+};
+
+test "indexAll indexes files across batch boundary and skips unchanged on reindex" {
+    const allocator = std.testing.allocator;
+
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const conv_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-idx-success", .{tmpdir});
+    defer allocator.free(conv_dir);
+    const proj_dir = try std.fmt.allocPrint(allocator, "{s}/-Users-test-proj", .{conv_dir});
+    defer allocator.free(proj_dir);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/session.jsonl", .{proj_dir});
+    defer allocator.free(file_path);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), proj_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), file_path, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(),
+            \\{"type":"user","timestamp":"2026-03-06T12:00:00Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hello world"}]}}
+            \\{"type":"user","timestamp":"2026-03-06T12:00:01Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"second message"}]}}
+            \\
+        );
+    }
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var result = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer result.deinit(allocator);
+
+    var dummy: u8 = 0;
+    const embedder = embedding.Embedder{
+        .ctx = @ptrCast(&dummy),
+        .embed = OkEmbedder.embed,
+        .free = OkEmbedder.free,
+    };
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
+
+    // batch_size of 1 forces a flush after every message — exercises the flush boundary.
+    const stats = try indexAll(allocator, db, conv_dir, embedder, 1, false, &w.interface);
+    try std.testing.expectEqual(@as(usize, 1), stats.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), stats.files_indexed);
+    try std.testing.expectEqual(@as(usize, 2), stats.messages_indexed);
+    try std.testing.expectEqual(@as(usize, 0), stats.embedding_failures);
+    try std.testing.expectEqual(@as(i64, 2), storage.getMessageCount(db));
+
+    // Reindex with the file unchanged: it should be scanned but not re-indexed.
+    const stats2 = try indexAll(allocator, db, conv_dir, embedder, 1, false, &w.interface);
+    try std.testing.expectEqual(@as(usize, 1), stats2.files_scanned);
+    try std.testing.expectEqual(@as(usize, 0), stats2.files_indexed);
+    try std.testing.expectEqual(@as(usize, 0), stats2.messages_indexed);
 }
