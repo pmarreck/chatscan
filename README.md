@@ -84,6 +84,9 @@ Search options (by default, only the CURRENT directory's project is searched):
   --project <path>              Limit to a project by name or PARTIAL PATH
                                 (case-insensitive; '/' in the filter matches the stored '-')
   --role <user|assistant>       Filter by message role
+  --since <YYYY-MM-DD>           Only results on/after this date
+  --until <YYYY-MM-DD>           Only results on/before this date
+  --date <YYYY-MM-DD>            Only results on this exact day (--since == --until)
   --regex                       Use ripgrep for regex search
   --mode <vector|lexical|hybrid> Search mode (default hybrid)
   --context-lines <n>           Lines to show per message (default 4)

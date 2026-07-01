@@ -36,6 +36,21 @@ pub const Seen = struct {
     embedding_api_key: bool = false,
 };
 
+/// Validate a "YYYY-MM-DD" date string (the granularity chatscan filters on).
+/// Checks length, dash positions, digit classes, and basic month/day ranges.
+fn isValidDate(s: []const u8) bool {
+    if (s.len != 10) return false;
+    if (s[4] != '-' or s[7] != '-') return false;
+    for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9 }) |idx| {
+        if (s[idx] < '0' or s[idx] > '9') return false;
+    }
+    const month = (s[5] - '0') * 10 + (s[6] - '0');
+    const day = (s[8] - '0') * 10 + (s[9] - '0');
+    if (month < 1 or month > 12) return false;
+    if (day < 1 or day > 31) return false;
+    return true;
+}
+
 pub const Parsed = struct {
     command: CommandTag = .search,
     assumed_search: bool = false,
@@ -52,6 +67,8 @@ pub const Parsed = struct {
     context_lines: usize = 4,
     all_projects: bool = false,
     project: ?[]const u8 = null,
+    since: ?[]const u8 = null,
+    until: ?[]const u8 = null,
     regex_mode: bool = false,
     reindex: bool = false,
     force: bool = false,
@@ -142,6 +159,31 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                     return error.InvalidRole;
                 }
                 parsed.role_filter = val;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--since") or std.mem.eql(u8, arg, "--after")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                if (!isValidDate(args[i])) return error.InvalidDate;
+                parsed.since = args[i];
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--until") or std.mem.eql(u8, arg, "--before")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                if (!isValidDate(args[i])) return error.InvalidDate;
+                parsed.until = args[i];
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--date") or std.mem.eql(u8, arg, "--on")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                if (!isValidDate(args[i])) return error.InvalidDate;
+                parsed.since = args[i];
+                parsed.until = args[i];
                 i += 1;
                 continue;
             }

@@ -17,6 +17,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 BIN="${CHATSCAN_BIN:-$REPO_ROOT/zig-out/bin/chatscan}"
+# Absolutize BIN: several tests `cd` into temp dirs, so a relative path would break.
+case "$BIN" in /*) ;; *) BIN="$(cd "$(dirname "$BIN")" && pwd -P)/$(basename "$BIN")" ;; esac
 FIX="$SCRIPT_DIR/fixtures/conversations"
 
 FAILS=0
@@ -133,6 +135,20 @@ assert_contains "$scope_err" "limiting to the current project" "default scoping 
 # --- 9. Missing query is a clear error, not a silent nothing ------------------
 noq_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" --project alpha 2>&1 >/dev/null)"
 assert_contains "$noq_err" "error" "a search with no query text reports a clear error"
+
+# --- 10. Date filtering: --date / --since / --until over the fixture ----------
+# Fixture html mentions: alpha=2026-03-01, beta=2026-03-02 (gamma has none).
+assert_eq 1 "$(count html --all --date 2026-03-01)" "--date 2026-03-01 keeps only the Mar-1 (alpha) html hit"
+assert_eq "alpha" "$(names html --all --date 2026-03-01)" "--date 2026-03-01 selects alpha"
+assert_eq 1 "$(count html --all --since 2026-03-02)" "--since 2026-03-02 drops the earlier alpha hit"
+assert_eq "beta" "$(names html --all --since 2026-03-02)" "--since 2026-03-02 keeps beta"
+assert_eq 1 "$(count html --all --until 2026-03-01)" "--until 2026-03-01 keeps only alpha"
+assert_eq 2 "$(count html --all --since 2026-03-01 --until 2026-03-02)" "--since/--until range spans alpha+beta"
+assert_eq 0 "$(count html --all --date 2026-03-03)" "--date 2026-03-03 (gamma day) has no html"
+
+# Invalid date is a clear error, not a silent empty result.
+date_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --since 2026-13-99 2>&1 >/dev/null)"
+assert_contains "$date_err" "YYYY-MM-DD" "an invalid --since date reports a clear format error"
 
 # --- Summary -----------------------------------------------------------------
 echo

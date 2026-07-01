@@ -30,6 +30,8 @@ pub const Options = struct {
     role_filter: ?[]const u8 = null,
     project_filter: ?[]const u8 = null,
     project_dir_filter: ?[]const u8 = null,
+    since: ?[]const u8 = null,
+    until: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -123,7 +125,7 @@ pub fn search(
     }
 
     // Apply filters
-    if (options.role_filter != null or options.project_filter != null or options.project_dir_filter != null) {
+    if (options.role_filter != null or options.project_filter != null or options.project_dir_filter != null or options.since != null or options.until != null) {
         var filtered = std.ArrayListUnmanaged(Result).empty;
         for (results.items) |res| {
             var keep = true;
@@ -137,6 +139,9 @@ pub fn search(
                 if (res.message.project_dir) |mpd| {
                     if (!std.mem.eql(u8, mpd, pd)) keep = false;
                 } else keep = false;
+            }
+            if (options.since != null or options.until != null) {
+                if (!dateInRange(res.message.timestamp, options.since, options.until)) keep = false;
             }
             if (keep) {
                 try filtered.append(allocator, res);
@@ -466,6 +471,24 @@ pub fn projectMatches(project_name: ?[]const u8, project_dir: ?[]const u8, filte
     return false;
 }
 
+/// Inclusive day-range filter: keep a message whose timestamp's date (YYYY-MM-DD)
+/// falls within [since, until]. Bounds are "YYYY-MM-DD" (or null). ISO-8601
+/// timestamps sort lexicographically, so we compare the leading 10-char date slice.
+/// A message with no usable timestamp fails any active date filter.
+pub fn dateInRange(timestamp: ?[]const u8, since: ?[]const u8, until: ?[]const u8) bool {
+    if (since == null and until == null) return true;
+    const ts = timestamp orelse return false;
+    if (ts.len < 10) return false;
+    const ts_date = ts[0..10];
+    if (since) |s| {
+        if (std.mem.order(u8, ts_date, s) == .lt) return false;
+    }
+    if (until) |u| {
+        if (std.mem.order(u8, ts_date, u) == .gt) return false;
+    }
+    return true;
+}
+
 
 
 /// Compute a recency score from 0.0 (ancient) to 1.0 (now).
@@ -687,4 +710,36 @@ test "vector-mode search over an in-memory sqlite-vec index does not crash" {
     const sr = try search(allocator, db, embedder, "html", .{ .mode = .vector, .top_n = 10 });
     defer freeResults(allocator, sr.results);
     try std.testing.expect(sr.results.len >= 1);
+}
+
+
+test "dateInRange: since/until as an inclusive day-range classifier over a set" {
+    const ts_jun30 = "2026-06-30T23:59:00.000Z";
+    const ts_jul01a = "2026-07-01T00:10:00.000Z";
+    const ts_jul01b = "2026-07-01T13:45:00.000Z";
+    const ts_jul02 = "2026-07-02T08:00:00.000Z";
+
+    // No bounds: everything passes (including null timestamps).
+    try std.testing.expect(dateInRange(ts_jul01a, null, null));
+    try std.testing.expect(dateInRange(null, null, null));
+
+    // --since 2026-07-01 (inclusive lower bound): drops Jun 30, keeps Jul 1 & 2.
+    try std.testing.expect(!dateInRange(ts_jun30, "2026-07-01", null));
+    try std.testing.expect(dateInRange(ts_jul01a, "2026-07-01", null));
+    try std.testing.expect(dateInRange(ts_jul02, "2026-07-01", null));
+
+    // --until 2026-07-01 (inclusive upper bound): keeps Jun 30 & all of Jul 1, drops Jul 2.
+    try std.testing.expect(dateInRange(ts_jun30, null, "2026-07-01"));
+    try std.testing.expect(dateInRange(ts_jul01b, null, "2026-07-01"));
+    try std.testing.expect(!dateInRange(ts_jul02, null, "2026-07-01"));
+
+    // Range: only Jul 1 (both timestamps that day), excludes the neighbours.
+    try std.testing.expect(!dateInRange(ts_jun30, "2026-07-01", "2026-07-01"));
+    try std.testing.expect(dateInRange(ts_jul01a, "2026-07-01", "2026-07-01"));
+    try std.testing.expect(dateInRange(ts_jul01b, "2026-07-01", "2026-07-01"));
+    try std.testing.expect(!dateInRange(ts_jul02, "2026-07-01", "2026-07-01"));
+
+    // A message with no timestamp cannot satisfy an active date filter.
+    try std.testing.expect(!dateInRange(null, "2026-07-01", null));
+    try std.testing.expect(!dateInRange(null, null, "2026-07-01"));
 }

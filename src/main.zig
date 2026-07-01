@@ -78,7 +78,12 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_writer.interface;
 
     var parsed = cli.parse(allocator, args) catch |err| {
-        _ = stderr.print("error: {}\n", .{err}) catch {};
+        switch (err) {
+            error.InvalidDate => _ = stderr.print("error: invalid date — expected YYYY-MM-DD (e.g. --since 2026-07-01)\n", .{}) catch {},
+            error.MissingValue => _ = stderr.print("error: an option is missing its value\n", .{}) catch {},
+            error.InvalidRole => _ = stderr.print("error: --role must be 'user' or 'assistant'\n", .{}) catch {},
+            else => _ = stderr.print("error: {s}\n", .{@errorName(err)}) catch {},
+        }
         _ = stderr.flush() catch {};
         std.process.exit(64);
     };
@@ -279,6 +284,8 @@ pub fn main(init: std.process.Init) !void {
                 .role_filter = settings.role_filter,
                 .project_filter = settings.project,
                 .project_dir_filter = project_dir_filter,
+                .since = parsed.since,
+                .until = parsed.until,
             }) catch |err| {
                 _ = stderr.print("error: search failed: {s}\n", .{@errorName(err)}) catch {};
                 switch (err) {
@@ -715,6 +722,9 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --project <path>              Limit to a project by name or partial path
         \\                                (case-insensitive; '/' matches the stored '-')
         \\  --role <user|assistant>        Filter by message role
+        \\  --since <YYYY-MM-DD>          Only results on/after this date
+        \\  --until <YYYY-MM-DD>          Only results on/before this date
+        \\  --date <YYYY-MM-DD>           Only results on this exact day
         \\  --regex                       Use ripgrep for regex search
         \\  --mode <vector|lexical|hybrid> Search mode (default hybrid)
         \\  --context-lines <n>           Lines to show per message (default 4)
