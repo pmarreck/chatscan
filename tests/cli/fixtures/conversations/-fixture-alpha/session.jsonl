@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-03-01T10:00:00Z","sessionId":"a1","cwd":"/proj/alpha","message":{"role":"user","content":[{"type":"text","text":"how do I render html output in the browser"}]}}
+{"type":"user","timestamp":"2026-03-01T10:01:00Z","sessionId":"a1","cwd":"/proj/alpha","message":{"role":"user","content":[{"type":"text","text":"the dirtree command gives a nice project overview"}]}}

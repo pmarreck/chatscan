@@ -36,7 +36,8 @@ chatscan "config" --json
 - **Hybrid search** — equally weighted semantic (vector), lexical (FTS5), and recency scoring
 - **Recency weighting** — recent conversations rank higher (exponential decay, 30-day half-life)
 - **Sandwich display** — matched message shown bold, with previous/next messages dimmed for context
-- **Auto-scoping** — searches are scoped to the current project by default (falls back to all if no conversations exist for cwd)
+- **Auto-scoping (with escape hatches)** — searches are scoped to the current directory's project by default, and say so on stderr; use `--all` to search everything or `--project <name-or-partial-path>` to target another project
+- **Env-var overrides** — `CHATSCAN_DB` and `CHATSCAN_CONVERSATION_DIR` (plus `CHATSCAN_LLM`) override paths without flags; CLI flags override env vars override config
 - **Incremental indexing** — only re-indexes changed files based on mtime
 - **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
@@ -77,10 +78,11 @@ chatscan rename <old> <new>   Rename project dir + update all logs
 chatscan config               Show configuration
 chatscan help                 Show this help
 
-Search options:
+Search options (by default, only the CURRENT directory's project is searched):
   --top <n>                     Number of results (default 10)
-  --all                         Search all projects
-  --project <name>              Search specific project
+  --all                         Search across every project (not just the current one)
+  --project <path>              Limit to a project by name or PARTIAL PATH
+                                (case-insensitive; '/' in the filter matches the stored '-')
   --role <user|assistant>       Filter by message role
   --regex                       Use ripgrep for regex search
   --mode <vector|lexical|hybrid> Search mode (default hybrid)
@@ -96,8 +98,8 @@ Index options:
   --reindex                     Force full re-index
 
 Global options:
-  --db <path>                   SQLite database path
-  --conversation-dir <path>     Conversation files directory
+  --db <path>                   SQLite database path (env: CHATSCAN_DB)
+  --conversation-dir <path>     Conversation files directory (env: CHATSCAN_CONVERSATION_DIR)
   --ollama-url <url>            Ollama server URL (backend=ollama)
   --ollama-model <name>         Embedding model name (backend=ollama)
   --backend <ollama|openai|mlx> Embedding backend (default: ollama)
@@ -105,6 +107,40 @@ Global options:
   --embedding-model <name>      Override embedding model name
   --embedding-api-key <key>     API key for OpenAI-compatible backend
   --embedding-dim <n>           Embedding dimension
+```
+
+### Scope: current project vs. everything
+
+By default `chatscan <query>` searches **only the project for the current
+directory** (matched by the cwd, with symlinks resolved), and prints a note to
+stderr saying so. If a search comes back empty, chatscan explains *why* on
+stderr rather than leaving you guessing:
+
+```bash
+chatscan html
+# note: limiting to the current project (-Users-you-Code-myproj). Use --all to
+#       search every project, or --project <path> to pick another.
+# note: no matches in the current project. Re-run with --all to search all projects.
+
+chatscan html --all                 # search every indexed project
+chatscan html --project validate    # by name (case-insensitive, partial)
+chatscan html --project Code/validate   # by partial path ('/' matches the stored '-')
+```
+
+> Tip: if you moved/renamed a project directory (e.g. via a symlink), its older
+> conversations may be stored under the *previous* path. `--all`, or a
+> `--project` fragment common to both paths, will find them.
+
+### Environment overrides
+
+Paths can be set by env var instead of flags — handy for scripting and tests.
+Precedence is **CLI flag → env var → config file → built-in default**:
+
+```bash
+export CHATSCAN_DB=/tmp/scratch-index.sqlite3
+export CHATSCAN_CONVERSATION_DIR=/path/to/fixture/conversations
+chatscan index
+chatscan "query" --all
 ```
 
 ## Multi-LLM support

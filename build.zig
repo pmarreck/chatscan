@@ -11,6 +11,14 @@ pub fn build(b: *std.Build) void {
     const sqlite3_lib = sqlite_vec_dep.artifact("sqlite3");
     const vec_static_lib = sqlite_vec_dep.artifact("sqlite_vec0");
 
+    // sqlite-vec 0.1.7-alpha trips Zig's C UBSan (trap mode) at ReleaseFast/
+    // ReleaseSafe — the vec0 vtable ops (insert + KNN) hit undefined behaviour
+    // that -O0/Debug tolerates, so the process takes a SIGTRAP with no message.
+    // The behaviour is benign in practice (Debug produces correct results), so
+    // disable the C undefined-behaviour sanitizer for these third-party C libs.
+    sqlite3_lib.root_module.sanitize_c = .off;
+    vec_static_lib.root_module.sanitize_c = .off;
+
     const main_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

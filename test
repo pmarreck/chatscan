@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Full chatscan test suite: Zig unit/integration tests + bash CLI integration
+# tests. Accumulates failures across groups; exit code is the number of failing
+# groups (0 = everything passed).
+#
+# Usage:
+#   ./test              build (ReleaseFast via nix), then run all tests
+#   ./test --no-build   skip the build, test the existing zig-out/bin/chatscan
+#
+# Per house rules: `set -u` only (no `set -e`) so we can run every group and
+# report a full tally rather than aborting on the first failure.
+
+set -u
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+no_build=0
+[ "${1:-}" = "--no-build" ] && no_build=1
+
+fails=0
+
+if [ "$no_build" -eq 0 ]; then
+	echo "==> Building chatscan (ReleaseFast)…"
+	if ! ./build; then
+		echo "build failed — aborting" >&2
+		exit 1
+	fi
+fi
+
+echo "==> Zig unit + integration tests (ReleaseSafe — matches CI, catches C-UBSan/-O2 issues)…"
+# ReleaseSafe (not the Debug default) is deliberate: the sqlite-vec vec0 ops only
+# misbehave under optimization, so a Debug-only test run hides that whole class of
+# bug. This mirrors flake.nix's Garnix check.
+if nix develop -c zig build test -Doptimize=ReleaseSafe; then
+	echo "    zig tests: PASS"
+else
+	echo "    zig tests: FAIL" >&2
+	fails=$((fails + 1))
+fi
+
+echo "==> CLI integration tests…"
+if nix develop -c bash tests/cli/search_cli_test.sh; then
+	echo "    CLI tests: PASS"
+else
+	echo "    CLI tests: FAIL" >&2
+	fails=$((fails + 1))
+fi
+
+echo
+if [ "$fails" -eq 0 ]; then
+	echo "✅ ALL TESTS PASSED"
+else
+	echo "❌ $fails test group(s) failed" >&2
+fi
+exit "$fails"

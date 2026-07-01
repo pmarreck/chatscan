@@ -131,9 +131,7 @@ pub fn search(
                 if (!std.mem.eql(u8, res.message.role, role)) keep = false;
             }
             if (options.project_filter) |proj| {
-                if (res.message.project_name) |pn| {
-                    if (!simd.eqlIgnoreCase(pn, proj)) keep = false;
-                } else keep = false;
+                if (!projectMatches(res.message.project_name, res.message.project_dir, proj)) keep = false;
             }
             if (options.project_dir_filter) |pd| {
                 if (res.message.project_dir) |mpd| {
@@ -430,6 +428,44 @@ fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
     return allocator.dupeZ(u8, tmp);
 }
 
+/// Normalize a byte for project matching: ASCII-lowercase, and treat the path
+/// separator '/' as equivalent to the conversation-dir slug separator '-' so a
+/// user can pass either a real path fragment or a slug fragment.
+fn normProjectChar(ch: u8) u8 {
+    const lc = std.ascii.toLower(ch);
+    return if (lc == '/') '-' else lc;
+}
+
+/// Case-insensitive, separator-insensitive substring test (haystack contains needle).
+/// O(n*m) but project strings are short; avoids any allocation on the filter path.
+fn containsNormalized(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (normProjectChar(haystack[i + j]) != normProjectChar(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+/// Does a message's project satisfy a `--project` filter? Partial + case-insensitive:
+/// matches when `filter` is a substring of either the project name OR the project dir
+/// slug (with '/' treated as '-'). This is what lets `--project Code/codescan` or
+/// `--project codes` narrow to the right project instead of requiring the exact name.
+pub fn projectMatches(project_name: ?[]const u8, project_dir: ?[]const u8, filter: []const u8) bool {
+    if (project_name) |pn| {
+        if (containsNormalized(pn, filter)) return true;
+    }
+    if (project_dir) |pd| {
+        if (containsNormalized(pd, filter)) return true;
+    }
+    return false;
+}
+
 
 
 /// Compute a recency score from 0.0 (ancient) to 1.0 (now).
@@ -539,4 +575,116 @@ test "search with zero top_n returns empty" {
     const sr = try search(allocator, db, null, "test", .{ .top_n = 0 });
     defer allocator.free(sr.results);
     try std.testing.expectEqual(@as(usize, 0), sr.results.len);
+}
+
+
+test "projectMatches: partial name/path, case-insensitive, classifier over a set" {
+    // Exact name still matches.
+    try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "codescan"));
+    // Substring of the name.
+    try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "codes"));
+    // Case-insensitive.
+    try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "CODESCAN"));
+    // Partial PATH: user types '/', slug uses '-' — they must be equivalent.
+    try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "Code/codescan"));
+    try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "code-codescan"));
+    // Non-match.
+    try std.testing.expect(!projectMatches("codescan", "-Users-pmarreck-Code-codescan", "validate"));
+
+    // As a classifier over a SET: "scan" selects the scan-projects, rejects validate.
+    try std.testing.expect(projectMatches("chatscan", "-x-chatscan", "scan"));
+    try std.testing.expect(projectMatches("docscan", "-x-docscan", "scan"));
+    try std.testing.expect(!projectMatches("validate", "-x-validate", "scan"));
+
+    // Null fields never match a non-empty filter.
+    try std.testing.expect(!projectMatches(null, null, "anything"));
+    // Empty filter is a no-op (matches anything present).
+    try std.testing.expect(projectMatches("codescan", null, ""));
+}
+
+test "lexical search finds indexed messages and --project partial-path filter narrows over a set" {
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // Two different projects, both mentioning "html".
+    _ = try storage.insertMessage(db, .{
+        .file_path = "a.jsonl", .line_number = 1, .role = "user",
+        .content = "how do I render html here", .timestamp = null, .session_id = null,
+        .project_name = "codescan", .project_dir = "-Users-pmarreck-Code-codescan",
+    });
+    _ = try storage.insertMessage(db, .{
+        .file_path = "b.jsonl", .line_number = 1, .role = "user",
+        .content = "the html output looks wrong", .timestamp = null, .session_id = null,
+        .project_name = "validate", .project_dir = "-Users-pmarreck-Code-validate",
+    });
+
+    // Baseline (the previously-untested core contract): lexical search finds BOTH across projects.
+    const all = try search(allocator, db, null, "html", .{ .mode = .lexical, .top_n = 10 });
+    defer freeResults(allocator, all.results);
+    try std.testing.expectEqual(@as(usize, 2), all.results.len);
+
+    // Narrow to just codescan using a PARTIAL PATH fragment.
+    const scoped = try search(allocator, db, null, "html", .{
+        .mode = .lexical, .top_n = 10, .project_filter = "Code/codescan",
+    });
+    defer freeResults(allocator, scoped.results);
+    try std.testing.expectEqual(@as(usize, 1), scoped.results.len);
+    try std.testing.expectEqualStrings("codescan", scoped.results[0].message.project_name.?);
+
+    // A non-matching filter yields nothing (and is not an error).
+    const none = try search(allocator, db, null, "html", .{
+        .mode = .lexical, .top_n = 10, .project_filter = "no-such-project",
+    });
+    defer freeResults(allocator, none.results);
+    try std.testing.expectEqual(@as(usize, 0), none.results.len);
+}
+
+
+test "vector-mode search over an in-memory sqlite-vec index does not crash" {
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // Insert several messages, each with a real 1024-dim embedding, so the
+    // KNN MATCH has multiple rows to rank (mirrors the crashing real query).
+    var n: usize = 0;
+    while (n < 20) : (n += 1) {
+        const rowid = try storage.insertMessage(db, .{
+            .file_path = "a.jsonl", .line_number = @intCast(n + 1), .role = "user",
+            .content = "vector target about html and dirtree", .timestamp = null, .session_id = null,
+            .project_name = "alpha", .project_dir = "-x-alpha",
+        });
+        var vec: [1024]f32 = undefined;
+        for (&vec, 0..) |*e, i| e.* = @floatFromInt(@as(i32, @intCast((i + n) % 7)));
+        try storage.insertEmbedding(db, allocator, rowid, &vec);
+    }
+
+    const MockEmb = struct {
+        buf: [1024]f32,
+        fn embed(ctx: *anyopaque, alloc: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const out = try alloc.alloc([]f32, inputs.len);
+            for (out) |*o| o.* = try alloc.dupe(f32, &self.buf);
+            return out;
+        }
+        fn free(ctx: *anyopaque, alloc: std.mem.Allocator, embs: [][]f32) void {
+            _ = ctx;
+            for (embs) |e| alloc.free(e);
+            alloc.free(embs);
+        }
+    };
+    var qvec: [1024]f32 = undefined;
+    for (&qvec, 0..) |*e, i| e.* = @floatFromInt(@as(i32, @intCast(i % 7)));
+    var mock = MockEmb{ .buf = qvec };
+    const embedder = embedding.Embedder{ .ctx = @ptrCast(&mock), .embed = MockEmb.embed, .free = MockEmb.free };
+
+    // This is the path that traps under ReleaseFast/ReleaseSafe (sqlite-vec KNN step).
+    const sr = try search(allocator, db, embedder, "html", .{ .mode = .vector, .top_n = 10 });
+    defer freeResults(allocator, sr.results);
+    try std.testing.expect(sr.results.len >= 1);
 }

@@ -253,12 +253,17 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
-            // Detect current project for default filtering
+            // Detect current project for default filtering. Be transparent about
+            // scoping — silently limiting to the cwd's project is the #1 "why did
+            // my search return nothing?" surprise.
             var project_dir_filter: ?[]const u8 = null;
             if (!settings.all_projects and settings.project == null) {
                 project_dir_filter = try detectCurrentProjectDir(allocator, settings.conversation_dir);
-                if (project_dir_filter == null) {
-                    _ = stderr.print("note: No conversations found for current directory. Searching all projects.\n", .{}) catch {};
+                if (project_dir_filter) |slug| {
+                    _ = stderr.print("note: limiting to the current project ({s}). Use --all to search every project, or --project <path> to pick another.\n", .{slug}) catch {};
+                    _ = stderr.flush() catch {};
+                } else {
+                    _ = stderr.print("note: no conversations indexed for the current directory; searching all projects.\n", .{}) catch {};
                     _ = stderr.flush() catch {};
                 }
             }
@@ -268,14 +273,34 @@ pub fn main(init: std.process.Init) !void {
                 break :blk .lexical;
             } else settings.search_mode;
 
-            const sr = try search_mod.search(allocator, db, emb, query, .{
+            const sr = search_mod.search(allocator, db, emb, query, .{
                 .top_n = settings.top_n,
                 .mode = effective_mode,
                 .role_filter = settings.role_filter,
                 .project_filter = settings.project,
                 .project_dir_filter = project_dir_filter,
-            });
+            }) catch |err| {
+                _ = stderr.print("error: search failed: {s}\n", .{@errorName(err)}) catch {};
+                switch (err) {
+                    error.EmptyQuery => _ = stderr.print("  (no query text was provided)\n", .{}) catch {},
+                    error.InvalidWeights => _ = stderr.print("  (search weights sum to zero; check --mode / config)\n", .{}) catch {},
+                    error.InvalidEmbeddingCount => _ = stderr.print("  (embedder returned an unexpected number of vectors; is the embedding model correct?)\n", .{}) catch {},
+                    else => {},
+                }
+                _ = stderr.flush() catch {};
+                std.process.exit(1);
+            };
             defer search_mod.freeResults(allocator, sr.results);
+
+            // Loudly explain an empty result set — usually it's scoping, not absence.
+            if (sr.total_relevant == 0) {
+                if (project_dir_filter != null) {
+                    _ = stderr.print("note: no matches in the current project. Re-run with --all to search all projects.\n", .{}) catch {};
+                } else if (settings.project) |p| {
+                    _ = stderr.print("note: no matches for --project '{s}'. Try a shorter path fragment, or --all.\n", .{p}) catch {};
+                }
+                _ = stderr.flush() catch {};
+            }
 
             const use_color = parsed.output != .json and runtime.getEnvVarOwned(allocator, "NO_COLOR") == error.EnvironmentVariableNotFound;
 
@@ -302,16 +327,21 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         break :blk try config.detectDefaultLlm(allocator);
     };
 
-    // DB path
+    // DB path: CLI flag > env (CHATSCAN_DB) > config > default
     var db_path: []const u8 = undefined;
     var db_path_owned = false;
     if (parsed.db_path) |p| {
         db_path = p;
-    } else if (cfg.db_path) |p| {
-        db_path = p;
-    } else {
-        db_path = try config.defaultDbPath(allocator);
+    } else if (runtime.getEnvVarOwned(allocator, "CHATSCAN_DB")) |env_val| {
+        db_path = env_val;
         db_path_owned = true;
+    } else |_| {
+        if (cfg.db_path) |p| {
+            db_path = p;
+        } else {
+            db_path = try config.defaultDbPath(allocator);
+            db_path_owned = true;
+        }
     }
 
     // Conversation dir — depends on LLM source
@@ -320,11 +350,16 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
     const effective_llm = if (llm_source == .all) config.LlmSource.claude else llm_source;
     if (parsed.conversation_dir) |p| {
         conv_dir = p;
-    } else if (cfg.conversation_dir) |p| {
-        conv_dir = p;
-    } else {
-        conv_dir = try config.defaultConversationDirForLlm(allocator, effective_llm);
+    } else if (runtime.getEnvVarOwned(allocator, "CHATSCAN_CONVERSATION_DIR")) |env_val| {
+        conv_dir = env_val;
         conv_dir_owned = true;
+    } else |_| {
+        if (cfg.conversation_dir) |p| {
+            conv_dir = p;
+        } else {
+            conv_dir = try config.defaultConversationDirForLlm(allocator, effective_llm);
+            conv_dir_owned = true;
+        }
     }
 
     // For --all-llms, build extra dirs for the other LLM sources
@@ -674,10 +709,11 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  chatscan config               Show configuration
         \\  chatscan help                 Show this help
         \\
-        \\Search options:
+        \\Search options (by default, only the CURRENT directory's project is searched):
         \\  --top <n>                     Number of results (default 10)
-        \\  --all                         Search all projects
-        \\  --project <name>              Search specific project
+        \\  --all                         Search across every project (not just the current one)
+        \\  --project <path>              Limit to a project by name or partial path
+        \\                                (case-insensitive; '/' matches the stored '-')
         \\  --role <user|assistant>        Filter by message role
         \\  --regex                       Use ripgrep for regex search
         \\  --mode <vector|lexical|hybrid> Search mode (default hybrid)
@@ -695,6 +731,10 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Global options:
         \\  --db <path>                   SQLite database path
         \\  --conversation-dir <path>     Conversation files directory
+        \\  CHATSCAN_DB=<path>            Env var alternative to --db
+        \\  CHATSCAN_CONVERSATION_DIR=<path>
+        \\                                Env var alternative to --conversation-dir
+        \\                                (CLI flags override env vars override config)
         \\  --ollama-url <url>            Ollama server URL
         \\  --ollama-model <name>         Embedding model name
         \\  --embedding-dim <n>           Embedding dimension
