@@ -6,26 +6,35 @@ maintained_by: agent
 
 # Learnings
 
-## sqlite-vec traps under optimization; Debug hides it (2026-07-01)
+## sqlite-vec function-pointer UB → SIGTRAP in Release builds (2026-07-01)
 
 `chatscan <query>` (default hybrid / `--mode vector`) crashed with
-`Trace/BPT trap: 5` (SIGTRAP) in **ReleaseFast** builds, while Debug worked
-fine. Root cause: `sqlite-vec` 0.1.7-alpha's vec0 vtable operations (both
-embedding **insert** and KNN **search**) contain undefined behaviour that
-Zig's C UBSan compiles to a trap under ReleaseFast/ReleaseSafe. At `-O0`
-(Debug) the offending path is tolerated, so the whole class was invisible to
-the default test run.
+`Trace/BPT trap: 5` (SIGTRAP) in **ReleaseFast** builds while Debug worked.
 
-- **Fix:** `build.zig` sets `sanitize_c = .off` on the `sqlite3` and
-  `sqlite_vec0` dependency artifacts. The behaviour is benign in practice
-  (Debug produces correct results), so suppressing the C UBSan trap on these
-  battle-tested third-party libs is the right call.
-- **Why the tests didn't catch it:** no test exercised vec0 ops, *and*
-  `zig build test` defaults to Debug (`standardOptimizeOption`). Two blind
-  spots stacked. Guards added: an in-memory vector-search test + an
-  embedding-insert path test, and `./test` now runs `-Doptimize=ReleaseSafe`
-  (matching `flake.nix`'s Garnix check) so the trap-class actually bites.
-- **General lesson:** for a Zig project wrapping third-party C, a Debug-only
-  test loop can hide real release crashes. Run the suite at ReleaseSafe (keeps
-  Zig safety checks *and* C UBSan traps) at least in CI, and make sure tests
-  actually call into the C dependency's hot paths.
+- **Root cause (found via clang `-fsanitize=undefined` on a minimal repro):**
+  `sqlite-vec.c:8323` called `fvec_cleanup_noop` / `sqlite3_free` **through a
+  function pointer of the wrong type** — `fvec_cleanup` was `void(*)(f32*)`
+  while the call site used `void(*)(void*)`. Calling a function through an
+  incompatible pointer type is genuine C undefined behaviour. Zig's C UBSan
+  (`-fsanitize=function`, on in Release/trap mode) traps on it; hence the
+  message-less SIGTRAP inside `sqlite3_step`.
+- **Why Debug didn't catch it (corrected):** it is NOT optimization-triggered
+  (clang flags it at `-O0` too). Zig's **Debug** C-sanitizer set omits the
+  `function` check while its **Release** (trap) set includes it. The check-set,
+  not the opt level, is what differs.
+- **Why it went unnoticed:** local builds default to Debug (`build.zig` uses
+  `standardOptimizeOption`), *and* no test exercised vec0 insert/KNN, so even
+  CI's ReleaseSafe run stayed green. It only surfaced when a Release binary ran
+  a vector search. Surfaced "now" because the Zig 0.16 migration set the current
+  toolchain whose Release trap-set includes `function` — not new code.
+- **Real fix:** upstream sqlite-vec fixed this exact UB (unified `fvec_cleanup`
+  with `vector_cleanup` as `void(*)(void*)`) by v0.1.10. We bumped our fork
+  pmarreck/sqlite-vec from v0.1.7-alpha.2 -> v0.1.10-alpha.4 (disabling the new
+  DISKANN/RESCORE companion .c files we don't use), rewired build.zig.zon + the
+  flake zigDepsHash, and **removed** the interim `sanitize_c = .off` band-aid.
+  ReleaseSafe tests now pass with the sanitizer fully on — the UB is gone, not
+  hidden.
+- **General lesson:** a Debug-only test loop can hide real Release crashes in
+  third-party C. Run the suite at ReleaseSafe (Zig safety checks + C UBSan) in
+  CI, and make sure tests actually call into the C dependency's hot paths. When
+  UBSan fires on a dependency, prefer fixing/upgrading the UB over suppressing.

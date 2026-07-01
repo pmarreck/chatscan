@@ -25,7 +25,7 @@
 				# build.zig.zon (sqlite_vec). Network access only here; the
 				# consumer build is fully offline.
 				# To recompute: set zigDepsHash = ""; nix build; copy printed hash.
-				zigDepsHash = "sha256-p/4X+fEseQN3WvyE6f7ASvCVN18+Ob+EZkkkgxqpSRk=";
+				zigDepsHash = "sha256-pihmKPtmwtp5WjN5e/XJ2yoZWQLWb/0ThD37oYNM7Lo=";
 
 				zigDeps = pkgs.stdenv.mkDerivation {
 					pname = "chatscan-zig-deps";

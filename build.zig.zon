@@ -9,8 +9,8 @@
     },
     .dependencies = .{
         .sqlite_vec = .{
-            .url = "git+https://github.com/pmarreck/sqlite-vec.git#c9d3630f56637276829d9ab0c54b1116c6d3e2ef",
-            .hash = "sqlite_vec-0.1.7-alpha.2-4Cdt0CTyBADFzDhhNOTSAUplRsfH1qs-DqwP6FwrZ641",
+            .url = "git+https://github.com/pmarreck/sqlite-vec.git#4e653f5f9a9a5e739a2462e77780ec023985aac5",
+            .hash = "sqlite_vec-0.1.10-alpha.4-4Cdt0AqTBQBLYSu0inXNMFMXVmFx41pwe7tCnTQVXSs0",
         },
     },
     .fingerprint = 0xa9128cf17a7bf7ed,
