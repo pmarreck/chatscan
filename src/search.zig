@@ -83,7 +83,7 @@ pub fn search(
     const limit = options.top_n * options.candidate_multiplier;
 
     if (options.mode == .lexical) {
-        const lexical = try lexicalCandidates(allocator, db, query, limit);
+        const lexical = try lexicalCandidates(allocator, db, query, limit, options);
         for (lexical) |res| try results.append(allocator, res);
         allocator.free(lexical);
     } else {
@@ -103,7 +103,7 @@ pub fn search(
                 defer seen.deinit();
                 for (results.items) |res| try seen.put(res.id, {});
 
-                const lexical = try lexicalCandidates(allocator, db, query, limit);
+                const lexical = try lexicalCandidates(allocator, db, query, limit, options);
                 defer allocator.free(lexical);
 
                 for (lexical) |res| {
@@ -118,7 +118,7 @@ pub fn search(
             }
         } else {
             // No embedder available — fall back to lexical
-            const lexical = try lexicalCandidates(allocator, db, query, limit);
+            const lexical = try lexicalCandidates(allocator, db, query, limit, options);
             for (lexical) |res| try results.append(allocator, res);
             allocator.free(lexical);
         }
@@ -259,19 +259,73 @@ fn vectorCandidates(
     return results.toOwnedSlice(allocator);
 }
 
+/// Build a case-insensitive LIKE pattern for a `--project` filter: wrap with %,
+/// mapping '/' to the slug separator '-' so a path fragment matches project_dir.
+/// This is an equal-or-superset of projectMatches (which still runs as the exact
+/// final filter), so pushing it into SQL only lets LIMIT apply to filtered rows.
+fn projectLikePattern(allocator: std.mem.Allocator, filter: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, filter.len + 2);
+    out[0] = '%';
+    for (filter, 0..) |c, i| out[i + 1] = if (c == '/') '-' else c;
+    out[filter.len + 1] = '%';
+    return out;
+}
+
+/// Append " AND ..." clauses for the active filters using column prefix `prefix`
+/// ("m." for joined queries, "" for the bare messages table). The emit order
+/// MUST match bindActiveFilters. These narrow the candidate set BEFORE LIMIT;
+/// the exact Zig filter pass still runs, so results are unchanged in content.
+fn appendFilterClauses(w: *std.Io.Writer, prefix: []const u8, o: Options) !void {
+    if (o.role_filter != null) try w.print(" AND {s}role = ?", .{prefix});
+    if (o.since != null) try w.print(" AND substr({s}timestamp, 1, 10) >= ?", .{prefix});
+    if (o.until != null) try w.print(" AND substr({s}timestamp, 1, 10) <= ?", .{prefix});
+    if (o.project_dir_filter != null) try w.print(" AND {s}project_dir = ?", .{prefix});
+    if (o.project_filter != null) try w.print(" AND ({s}project_name LIKE ? OR {s}project_dir LIKE ?)", .{ prefix, prefix });
+}
+
+/// Bind the active filters at 1-based index `start`, in appendFilterClauses order.
+/// `proj_pat` (the LIKE pattern) must outlive the step; null when no project filter.
+fn bindActiveFilters(s: *sqlite.sqlite3_stmt, start: c_int, o: Options, proj_pat: ?[]const u8) c_int {
+    var idx = start;
+    if (o.role_filter) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
+    }
+    if (o.since) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
+    }
+    if (o.until) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
+    }
+    if (o.project_dir_filter) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
+    }
+    if (o.project_filter != null) {
+        storage.bindTextPub(s, idx, proj_pat.?);
+        idx += 1;
+        storage.bindTextPub(s, idx, proj_pat.?);
+        idx += 1;
+    }
+    return idx;
+}
+
 fn lexicalCandidates(
     allocator: std.mem.Allocator,
     db: storage.Db,
     query: []const u8,
     limit: usize,
+    options: Options,
 ) ![]Result {
     // Try FTS5 first
-    const fts_results = try ftsCandidates(allocator, db, query, limit);
+    const fts_results = try ftsCandidates(allocator, db, query, limit, options);
     if (fts_results.len > 0) return fts_results;
     allocator.free(fts_results);
 
     // Fall back to LIKE
-    return likeCandidates(allocator, db, query, limit);
+    return likeCandidates(allocator, db, query, limit, options);
 }
 
 fn ftsCandidates(
@@ -279,20 +333,25 @@ fn ftsCandidates(
     db: storage.Db,
     query: []const u8,
     limit: usize,
+    options: Options,
 ) ![]Result {
-    const sql =
+    var sqlbuf: std.Io.Writer.Allocating = .init(allocator);
+    defer sqlbuf.deinit();
+    try sqlbuf.writer.writeAll(
         \\SELECT m.id, m.file_path, m.line_number, m.role, m.content,
         \\       m.timestamp, m.session_id, m.project_name, m.project_dir,
         \\       bm25(messages_fts, 1.0)
         \\FROM messages_fts AS fts
         \\JOIN messages AS m ON fts.rowid = m.id
-        \\WHERE messages_fts MATCH ?1
-        \\ORDER BY bm25(messages_fts, 1.0)
-        \\LIMIT ?2
-    ;
+        \\WHERE messages_fts MATCH ?
+    );
+    try appendFilterClauses(&sqlbuf.writer, "m.", options);
+    try sqlbuf.writer.writeAll("\nORDER BY bm25(messages_fts, 1.0)\nLIMIT ?");
+    const sql = try sqlbuf.toOwnedSlice();
+    defer allocator.free(sql);
 
     var stmt: ?*sqlite.sqlite3_stmt = null;
-    if (sqlite.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != sqlite.SQLITE_OK) {
+    if (sqlite.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != sqlite.SQLITE_OK) {
         return allocator.alloc(Result, 0);
     }
     defer _ = sqlite.sqlite3_finalize(stmt);
@@ -301,9 +360,12 @@ fn ftsCandidates(
     // Build FTS query: OR all tokens for broad matching
     const fts_query = try buildFtsQuery(allocator, query);
     defer allocator.free(fts_query);
+    const proj_pat = if (options.project_filter) |pf| try projectLikePattern(allocator, pf) else null;
+    defer if (proj_pat) |pp| allocator.free(pp);
 
     storage.bindTextPub(s, 1, fts_query);
-    _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
+    const limit_idx = bindActiveFilters(s, 2, options, proj_pat);
+    _ = sqlite.sqlite3_bind_int(s, limit_idx, @intCast(limit));
 
     var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
@@ -344,27 +406,37 @@ fn likeCandidates(
     db: storage.Db,
     query: []const u8,
     limit: usize,
+    options: Options,
 ) ![]Result {
     const like_pattern = try allocPrintZ(allocator, "%{s}%", .{query});
     defer allocator.free(like_pattern);
 
-    const sql =
+    var sqlbuf: std.Io.Writer.Allocating = .init(allocator);
+    defer sqlbuf.deinit();
+    try sqlbuf.writer.writeAll(
         \\SELECT id, file_path, line_number, role, content,
         \\       timestamp, session_id, project_name, project_dir
         \\FROM messages
-        \\WHERE content LIKE ?1 COLLATE NOCASE
-        \\LIMIT ?2
-    ;
+        \\WHERE content LIKE ? COLLATE NOCASE
+    );
+    try appendFilterClauses(&sqlbuf.writer, "", options);
+    try sqlbuf.writer.writeAll("\nLIMIT ?");
+    const sql = try sqlbuf.toOwnedSlice();
+    defer allocator.free(sql);
 
     var stmt: ?*sqlite.sqlite3_stmt = null;
-    if (sqlite.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != sqlite.SQLITE_OK) {
+    if (sqlite.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != sqlite.SQLITE_OK) {
         return allocator.alloc(Result, 0);
     }
     defer _ = sqlite.sqlite3_finalize(stmt);
     const s = stmt.?;
 
+    const proj_pat = if (options.project_filter) |pf| try projectLikePattern(allocator, pf) else null;
+    defer if (proj_pat) |pp| allocator.free(pp);
+
     storage.bindTextPub(s, 1, like_pattern);
-    _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
+    const limit_idx = bindActiveFilters(s, 2, options, proj_pat);
+    _ = sqlite.sqlite3_bind_int(s, limit_idx, @intCast(limit));
 
     var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
@@ -742,4 +814,47 @@ test "dateInRange: since/until as an inclusive day-range classifier over a set" 
     // A message with no timestamp cannot satisfy an active date filter.
     try std.testing.expect(!dateInRange(null, "2026-07-01", null));
     try std.testing.expect(!dateInRange(null, null, "2026-07-01"));
+}
+
+
+test "filtered search finds a target ranked beyond the FTS candidate limit" {
+    // Repro: filters used to run AFTER the top_n*multiplier FTS limit, so a
+    // low-bm25 matching row in the target project/date was cut before filtering.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // 50 strong-matching noise rows (higher bm25) in a different project/day.
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        _ = try storage.insertMessage(db, .{
+            .file_path = "noise.jsonl", .line_number = @intCast(i + 1), .role = "user",
+            .content = "html html html html html noise", .timestamp = "2026-01-01T00:00:00Z",
+            .session_id = null, .project_name = "noise", .project_dir = "-x-noise",
+        });
+    }
+    // 1 weak-matching target row (lower bm25) in the project/day we filter to.
+    _ = try storage.insertMessage(db, .{
+        .file_path = "target.jsonl", .line_number = 1, .role = "user",
+        .content = "a single html mention", .timestamp = "2026-06-01T00:00:00Z",
+        .session_id = null, .project_name = "target", .project_dir = "-x-target",
+    });
+
+    // top_n=3 -> old FTS limit=15 fills with noise, cutting the target.
+    const by_project = try search(allocator, db, null, "html", .{
+        .mode = .lexical, .top_n = 3, .project_filter = "target",
+    });
+    defer freeResults(allocator, by_project.results);
+    try std.testing.expectEqual(@as(usize, 1), by_project.results.len);
+    try std.testing.expectEqualStrings("target", by_project.results[0].message.project_name.?);
+
+    // Same story for a date filter.
+    const by_date = try search(allocator, db, null, "html", .{
+        .mode = .lexical, .top_n = 3, .since = "2026-06-01", .until = "2026-06-01",
+    });
+    defer freeResults(allocator, by_date.results);
+    try std.testing.expectEqual(@as(usize, 1), by_date.results.len);
+    try std.testing.expectEqualStrings("target", by_date.results[0].message.project_name.?);
 }
