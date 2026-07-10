@@ -4,44 +4,105 @@
 # groups (0 = everything passed).
 #
 # Usage:
-#   ./test              build (ReleaseFast via nix), then run all tests
-#   ./test --no-build   skip the build, test the existing zig-out/bin/chatscan
+#   ./test              build the package, then run the sandboxed full check
+#   ./test --no-build   skip the separate package build; still build the
+#                      check-private CLI needed by the hermetic suite
 #
 # Per house rules: `set -u` only (no `set -e`) so we can run every group and
 # report a full tally rather than aborting on the first failure.
 
 set -u
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+root="$PWD"
+
+# The deterministic suite discovers the two live-Ollama tests but makes their
+# service dependency unavailable so Zig reports them as skipped. Override only
+# when invoking the marked direct path in a provisioned development shell; the
+# ordinary Nix check is pure and intentionally cannot inherit host variables.
+export OLLAMA_URL="${CHATSCAN_TEST_OLLAMA_URL:-http://127.0.0.1:1}"
 
 no_build=0
 [ "${1:-}" = "--no-build" ] && no_build=1
 
 fails=0
 
+if [ "${CHATSCAN_IN_NIX_CHECK:-0}" = "1" ]; then
+	run_ci_group() {
+		local name="$1"
+		shift
+
+		echo "==> $name…"
+		"$@"
+		local rc=$?
+		if [ "$rc" -eq 0 ]; then
+			echo "    $name: PASS"
+		else
+			echo "    $name: FAIL (exit $rc)" >&2
+			fails=$((fails + 1))
+		fi
+	}
+
+	zig_flags=(
+		-Dcpu=baseline
+		-Doptimize=ReleaseSafe
+		--color off
+	)
+	if [ -n "${CHATSCAN_ZIG_TARGET:-}" ]; then
+		zig_flags=("-Dtarget=$CHATSCAN_ZIG_TARGET" "${zig_flags[@]}")
+	fi
+
+	if [ "${CHATSCAN_CI_CONTRACT_NESTED:-0}" != "1" ]; then
+		run_ci_group "CI contract" bash tests/ci_contract
+	fi
+	run_ci_group "ReleaseSafe CLI build" zig build "${zig_flags[@]}"
+	run_ci_group "ReleaseSafe Zig unit + integration tests" \
+		zig build "${zig_flags[@]}" test
+
+	cli_test="${CHATSCAN_CLI_TEST:-tests/cli/search_cli_test.sh}"
+	# Passed by name to run_ci_group.
+	# shellcheck disable=SC2329
+	run_ci_cli() {
+		CHATSCAN_BIN="$root/zig-out/bin/chatscan" bash "$cli_test"
+	}
+	run_ci_group "CLI integration tests" run_ci_cli
+
+	echo
+	if [ "$fails" -eq 0 ]; then
+		echo "✅ ALL TESTS PASSED"
+	else
+		echo "❌ $fails test group(s) failed" >&2
+	fi
+	exit "$fails"
+fi
+
+echo "==> CI contract…"
+if bash tests/ci_contract; then
+	echo "    CI contract: PASS"
+else
+	echo "    CI contract: FAIL" >&2
+	fails=$((fails + 1))
+fi
+
 if [ "$no_build" -eq 0 ]; then
-	echo "==> Building chatscan (ReleaseFast)…"
+	echo "==> Building chatscan package…"
 	if ! ./build; then
 		echo "build failed — aborting" >&2
 		exit 1
 	fi
 fi
 
-echo "==> Zig unit + integration tests (ReleaseSafe — matches CI, catches C-UBSan/-O2 issues)…"
-# ReleaseSafe (not the Debug default) is deliberate: the sqlite-vec vec0 ops only
-# misbehave under optimization, so a Debug-only test run hides that whole class of
-# bug. This mirrors flake.nix's Garnix check.
-if nix develop -c zig build test -Doptimize=ReleaseSafe; then
-	echo "    zig tests: PASS"
-else
-	echo "    zig tests: FAIL" >&2
-	fails=$((fails + 1))
+system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+rc=$?
+if [ "$rc" -ne 0 ] || [ -z "$system" ]; then
+	echo "could not determine the current Nix system" >&2
+	exit 1
 fi
 
-echo "==> CLI integration tests…"
-if nix develop -c bash tests/cli/search_cli_test.sh; then
-	echo "    CLI tests: PASS"
+echo "==> Sandboxed full suite ($system)…"
+if nix build ".#checks.${system}.test"; then
+	echo "    sandboxed full suite: PASS"
 else
-	echo "    CLI tests: FAIL" >&2
+	echo "    sandboxed full suite: FAIL" >&2
 	fails=$((fails + 1))
 fi
 

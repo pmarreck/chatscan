@@ -68,6 +68,40 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/chatscan help
 ```
 
+## Testing
+
+Run the complete suite through the repository's sandboxed Nix check:
+
+```bash
+./test
+```
+
+`./test --no-build` skips the separate package artifact build, but the pure
+check still builds its own private CLI before running integration tests.
+
+CI evaluates `checks.x86_64-linux.test`. The check calls the same `./test`
+entrypoint inside the Nix sandbox, builds the CLI and runs the Zig suite in
+ReleaseSafe, then runs the Bash CLI integration suite. Linux binaries target
+static musl with `-Dcpu=baseline` so they remain portable across builders.
+
+The deterministic suite still discovers the two live-Ollama tests, but points
+them at an unavailable loopback port so their existing `SkipZigTest` path makes
+the external service boundary explicit. An ordinary `./test` is a pure Nix
+build, so host environment variables cannot opt it into a local service. For an
+explicit x86_64 Linux live-service run, enter the dev shell and invoke the
+marked direct path:
+
+```bash
+nix develop
+CHATSCAN_IN_NIX_CHECK=1 \
+  CHATSCAN_ZIG_TARGET=x86_64-linux-musl \
+  CHATSCAN_TEST_OLLAMA_URL=http://localhost:11434 \
+  ./test
+```
+
+Use `aarch64-linux-musl` on ARM Linux; leave `CHATSCAN_ZIG_TARGET` unset on
+Darwin.
+
 ## Usage
 
 ```

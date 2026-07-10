@@ -47,6 +47,8 @@ fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/chatscan-cli.XXXXXX")"
 WORK="$(cd "$WORK" && pwd -P)"
+# Invoked by the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 

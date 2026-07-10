@@ -1,9 +1,14 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
-	LEARNINGS.md = Hard-won toolchain/codebase lessons (sqlite-vec UBSan trap, Debug-hides-release-bug)
-	build.zig = Build: links dep sqlite3/sqlite_vec0 with sanitize_c=.off (vec0 UBSan-traps under -O2); wires unit tests
-	test = Full test runner: nix build + zig unit/integration tests + bash CLI suite; exit code = failing groups
+	LEARNINGS.md = Hard-won sqlite-vec UBSan and pure Nix sandbox execution lessons
+	MISTAKES.md = Agent workflow mistakes and corrective lessons
+	PLAN.md = Current checked CI repair plan with completion times and curiosity pokes
+	README.md = Project overview, installation, testing, usage, and configuration documentation
+	build.zig = Build: links sqlite3/sqlite_vec0 and wires aggregated plus per-module unit tests
+	flake.nix = Nix package, dependency cache, dev shell, and sandboxed full-suite CI derivation
+	test = Full runner: build, ReleaseSafe Zig tests, CLI integration, and non-recursive Nix-check mode
+	tests/ci_contract = CI-honesty control for build, ReleaseSafe tests, CLI tests, portable CPU, and failure propagation
 	tests/cli/fixtures/conversations = Committed conversation fixture (alpha/beta/gamma projects) used to build a deterministic index for CLI tests
 	tests/cli/search_cli_test.sh = CLI integration tests: default scoping, --all, --project partial path/name, env overrides, verbose messaging over a fixture index
 ]

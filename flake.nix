@@ -15,6 +15,12 @@
 			let
 				pkgs = import nixpkgs { inherit system; };
 				zigPkg = zig-overlay.packages.${system}."0.16.0";
+				testTarget =
+					if system == "x86_64-linux" then "x86_64-linux-musl"
+					else if system == "aarch64-linux" then "aarch64-linux-musl"
+					else "";
+				packageTargetFlag =
+					if testTarget == "" then "" else "-Dtarget=${testTarget}";
 				sqlite-amalgamation = pkgs.fetchzip {
 					url = "https://www.sqlite.org/2024/sqlite-amalgamation-3450300.zip";
 					sha256 = "sha256-F50oTmmcPIl0AZJbsWAR3tbNAPV3pQLf+CNITzhmXfI=";
@@ -67,6 +73,8 @@
 						chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
 
 						zig build \
+							${packageTargetFlag} \
+							-Dcpu=baseline \
 							-Doptimize=ReleaseSafe \
 							--color off
 					'';
@@ -82,6 +90,35 @@
 						platforms = platforms.unix;
 						mainProgram = "chatscan";
 					};
+				};
+
+				checks.test = pkgs.stdenv.mkDerivation {
+					pname = "chatscan-test";
+					version = "0.1.0";
+					src = ./.;
+
+					nativeBuildInputs = [ zigPkg pkgs.bash pkgs.jq ];
+
+					dontConfigure = true;
+					dontFixup = true;
+
+					buildPhase = ''
+						export HOME=$TMPDIR
+						export SQLITE_VEC_SQLITE_AMALGAMATION_DIR="${sqlite-amalgamation}"
+						export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+						export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+						export CHATSCAN_ZIG_TARGET="${testTarget}"
+						mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+						cp -r ${zigDeps}/* "$ZIG_GLOBAL_CACHE_DIR"/
+						chmod -R u+w "$ZIG_GLOBAL_CACHE_DIR"
+
+						CHATSCAN_IN_NIX_CHECK=1 bash ./test
+					'';
+
+					installPhase = ''
+						mkdir -p $out
+						touch $out/tests-passed
+					'';
 				};
 
 				devShells.default = pkgs.mkShell {

@@ -38,3 +38,9 @@ maintained_by: agent
   third-party C. Run the suite at ReleaseSafe (Zig safety checks + C UBSan) in
   CI, and make sure tests actually call into the C dependency's hot paths. When
   UBSan fires on a dependency, prefer fixing/upgrading the UB over suppressing.
+
+## Pure Nix sandbox execution (2026-07-10)
+
+- 2026-07-10: A pure Nix build sandbox has neither `/usr/bin/env` nor the host's `/lib64` dynamic loader. Invoke repository scripts with the Nix-provided `bash`, and compile Linux test executables for a static musl target with `-Dcpu=baseline` when they must run during the derivation.
+- 2026-07-10: The Zig/Nix hook supplies `-Dcpu=baseline` for its default phases, but a custom `buildPhase` must state that portability contract explicitly.
+- 2026-07-10: The live-Ollama tests are discovered in the deterministic suite but must use their existing `SkipZigTest` path when no service is provisioned. Because ordinary `./test` routes through a pure Nix derivation, host variables cannot reach it; `CHATSCAN_TEST_OLLAMA_URL` is truthful only with the explicitly marked `CHATSCAN_IN_NIX_CHECK=1` direct path inside a provisioned dev shell. CI never silently depends on a builder-local Ollama instance or model inventory.

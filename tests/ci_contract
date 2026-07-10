@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Guard the CI handoff: Nix must run the real suite, on a portable CPU target,
+# and the suite entrypoint must reject a failing Zig test command.
+set -u
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+failures=0
+
+fail() {
+	printf 'FAIL: %s\n' "$1" >&2
+	failures=$((failures + 1))
+}
+
+assert_contains() {
+	local path="$1"
+	local needle="$2"
+	local description="$3"
+	local contents
+
+	if [[ ! -f "$path" ]]; then
+		fail "$description (missing $path)"
+		return
+	fi
+	contents="$(<"$path")"
+	if [[ "$contents" != *"$needle"* ]]; then
+		fail "$description"
+	fi
+}
+
+assert_not_contains() {
+	local path="$1"
+	local needle="$2"
+	local description="$3"
+	local contents
+
+	if [[ ! -f "$path" ]]; then
+		fail "$description (missing $path)"
+		return
+	fi
+	contents="$(<"$path")"
+	if [[ "$contents" == *"$needle"* ]]; then
+		fail "$description"
+	fi
+}
+
+if [[ ! -x "$root/test" ]]; then
+	fail 'top-level ./test must exist and be executable'
+fi
+
+top_entrypoints=("$root/test" "$root/build")
+for entrypoint in "${top_entrypoints[@]}"; do
+	assert_not_contains "$entrypoint" \
+		'nix develop -c zig build' \
+		"top-level entrypoint $(basename "$entrypoint") must not run native Zig through nix develop"
+done
+
+# The Nix interpolation syntax is intentionally matched literally.
+# shellcheck disable=SC2016
+assert_contains "$root/test" \
+	'nix build ".#checks.${system}.test"' \
+	'ordinary full suite must execute the sandboxed Nix check'
+
+assert_contains "$root/flake.nix" \
+	'checks.test = pkgs.stdenv.mkDerivation' \
+	'flake must expose a real checks.<system>.test derivation'
+assert_contains "$root/flake.nix" \
+	'CHATSCAN_IN_NIX_CHECK=1 bash ./test' \
+	'Nix test check must execute the top-level full-suite entrypoint'
+# The Nix interpolation syntax is intentionally matched literally.
+# shellcheck disable=SC2016
+assert_contains "$root/flake.nix" \
+	'export CHATSCAN_ZIG_TARGET="${testTarget}"' \
+	'Nix check must select a sandbox-executable target for its build platform'
+assert_contains "$root/flake.nix" \
+	'nativeBuildInputs = [ zigPkg pkgs.bash pkgs.jq ];' \
+	'Nix check must provide jq for the CLI integration suite'
+assert_contains "$root/test" \
+	'zig build' \
+	'test runner must execute Zig rather than merely report success'
+assert_contains "$root/test" \
+	'-Doptimize=ReleaseSafe' \
+	'full suite must exercise optimized ReleaseSafe code paths'
+assert_contains "$root/test" \
+	'tests/cli/search_cli_test.sh' \
+	'full suite must execute the CLI integration tests'
+assert_contains "$root/test" \
+	'CHATSCAN_TEST_OLLAMA_URL' \
+	'hermetic suite must make the external Ollama dependency explicit and overridable'
+assert_contains "$root/test" \
+	'tests/ci_contract' \
+	'full-suite entrypoint must include the CI contract test'
+
+if [[ -x "$root/test" ]]; then
+	fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/chatscan-ci-contract.XXXXXX")"
+	bash_path="$(command -v bash)"
+	# The single-quoted fragments are the literal body of the generated fake.
+	# shellcheck disable=SC2016
+	printf '#!%s\n%s\n%s\n' \
+		"$bash_path" \
+		'printf "%s\n" "$*" >> "$CHATSCAN_FAKE_ZIG_ARGS"' \
+		'exit 42' > "$fake_bin/zig"
+	chmod +x "$fake_bin/zig"
+	# shellcheck disable=SC2016
+	printf '#!%s\n%s\n%s\n' \
+		"$bash_path" \
+		'printf "invoked\n" > "$CHATSCAN_FAKE_CLI_MARKER"' \
+		'exit 43' > "$fake_bin/cli-test"
+	chmod +x "$fake_bin/cli-test"
+
+	CHATSCAN_IN_NIX_CHECK=1 \
+	CHATSCAN_CI_CONTRACT_NESTED=1 \
+	CHATSCAN_CLI_TEST="$fake_bin/cli-test" \
+	CHATSCAN_FAKE_CLI_MARKER="$fake_bin/cli-invoked" \
+	CHATSCAN_FAKE_ZIG_ARGS="$fake_bin/args" \
+	CHATSCAN_ZIG_TARGET=x86_64-linux-musl \
+	PATH="$fake_bin:$PATH" \
+		bash "$root/test" > "$fake_bin/runner.out" 2>&1
+	rc=$?
+	if [[ $rc -eq 0 ]]; then
+		fail 'test runner accepted a deliberately failing Zig suite (echo-only false-green)'
+	fi
+	runner_output="$(<"$fake_bin/runner.out")"
+	if [[ "$runner_output" != *'exit 42'* || "$runner_output" != *'exit 43'* ]]; then
+		fail 'test runner did not report both deliberate Zig and CLI failures'
+	fi
+	if [[ ! -f "$fake_bin/args" ]]; then
+		fail 'test runner did not execute Zig'
+	else
+		zig_args="$(<"$fake_bin/args")"
+		if [[ "$zig_args" != *'-Dtarget=x86_64-linux-musl'* ]]; then
+			fail 'test runner did not select the sandbox-executable Linux target'
+		fi
+		if [[ "$zig_args" != *'-Dcpu=baseline'* ]]; then
+			fail 'test runner did not select the baseline-portable CPU'
+		fi
+		if [[ "$zig_args" != *'-Doptimize=ReleaseSafe'* ]]; then
+			fail 'test runner did not exercise ReleaseSafe code paths'
+		fi
+		if [[ "$zig_args" != *'test'* ]]; then
+			fail 'test runner did not request the Zig test step'
+		fi
+		first_zig_call="${zig_args%%$'\n'*}"
+		remaining_zig_calls="${zig_args#*$'\n'}"
+		if [[ "$first_zig_call" == *'test'* || "$remaining_zig_calls" == "$zig_args" ]]; then
+			fail 'test runner did not build the CLI binary before running Zig tests'
+		fi
+	fi
+	if [[ ! -f "$fake_bin/cli-invoked" ]]; then
+		fail 'test runner omitted the CLI integration suite after Zig failure'
+	fi
+fi
+
+if [[ $failures -ne 0 ]]; then
+	printf '%d CI contract assertion(s) failed\n' "$failures" >&2
+	exit 1
+fi
+
+printf 'PASS: CI check executes the portable full test suite and propagates failure\n'
