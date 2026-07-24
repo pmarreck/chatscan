@@ -1,6 +1,7 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	.mechatron-prime/targets = Declares the exact Nix package and full-suite check built by Mechatron Prime CI.
 	LEARNINGS.md = Hard-won sqlite-vec UBSan and pure Nix sandbox execution lessons
 	MISTAKES.md = Agent workflow mistakes and corrective lessons
 	PLAN.md = Current checked CI repair plan with completion times and curiosity pokes
@@ -10,5 +11,6 @@ annotate=[
 	test = Full runner: build, ReleaseSafe Zig tests, CLI integration, and non-recursive Nix-check mode
 	tests/ci_contract = CI-honesty control for build, ReleaseSafe tests, CLI tests, portable CPU, and failure propagation
 	tests/cli/fixtures/conversations = Committed conversation fixture (alpha/beta/gamma projects) used to build a deterministic index for CLI tests
+	tests/cli/package_artifact_test.sh = Smoke-tests that the exact package artifact copied by ./build executes on the host.
 	tests/cli/search_cli_test.sh = CLI integration tests: default scoping, --all, --project partial path/name, env overrides, verbose messaging over a fixture index
 ]

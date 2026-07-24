@@ -1,6 +1,6 @@
 # chatscan
 
-[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fchatscan%3Fbranch%3Dyolo)](https://garnix.io)
+[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Fchatscan.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
 [![Build](https://github.com/pmarreck/chatscan/actions/workflows/build.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/chatscan/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -79,10 +79,12 @@ Run the complete suite through the repository's sandboxed Nix check:
 `./test --no-build` skips the separate package artifact build, but the pure
 check still builds its own private CLI before running integration tests.
 
-CI evaluates `checks.x86_64-linux.test`. The check calls the same `./test`
-entrypoint inside the Nix sandbox, builds the CLI and runs the Zig suite in
-ReleaseSafe, then runs the Bash CLI integration suite. Linux binaries target
-static musl with `-Dcpu=baseline` so they remain portable across builders.
+Mechatron Prime CI builds `packages.x86_64-linux.default` and evaluates
+`checks.x86_64-linux.test` from the exact pushed commit. The check calls the
+same `./test` entrypoint inside the Nix sandbox, builds the CLI and runs the Zig
+suite in ReleaseSafe, then runs the Bash CLI integration suite. Linux binaries
+target static musl with `-Dcpu=baseline` so they remain portable across
+builders.
 
 The deterministic suite still discovers the two live-Ollama tests, but points
 them at an unavailable loopback port so their existing `SkipZigTest` path makes

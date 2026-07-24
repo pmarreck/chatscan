@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;
 
     const sqlite_vec_dep = b.dependency("sqlite_vec", .{
         .target = target,
@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "chatscan",
         .root_module = main_module,
+        .linkage = if (target.result.os.tag == .linux) .static else null,
     });
     linkCommon(exe, sqlite3_lib, vec_static_lib);
     b.installArtifact(exe);

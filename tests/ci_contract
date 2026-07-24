@@ -66,6 +66,12 @@ assert_contains "$root/flake.nix" \
 assert_contains "$root/flake.nix" \
 	'CHATSCAN_IN_NIX_CHECK=1 bash ./test' \
 	'Nix test check must execute the top-level full-suite entrypoint'
+assert_contains "$root/build.zig" \
+	'const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;' \
+	'Zig builds must default to ReleaseFast'
+assert_contains "$root/flake.nix" \
+	'-Doptimize=ReleaseFast' \
+	'Nix package builds must use ReleaseFast'
 # The Nix interpolation syntax is intentionally matched literally.
 # shellcheck disable=SC2016
 assert_contains "$root/flake.nix" \
@@ -89,6 +95,30 @@ assert_contains "$root/test" \
 assert_contains "$root/test" \
 	'tests/ci_contract' \
 	'full-suite entrypoint must include the CI contract test'
+
+manifest="$root/.mechatron-prime/targets"
+if [[ ! -f "$manifest" ]]; then
+	fail 'Mechatron must build an exact-commit target manifest'
+else
+	mapfile -t actual_targets < <(
+		sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$manifest" |
+			LC_ALL=C sort -u
+	)
+	expected_targets=(
+		'checks.x86_64-linux.test'
+		'packages.x86_64-linux.default'
+	)
+	if [[ "${actual_targets[*]}" != "${expected_targets[*]}" ]]; then
+		fail 'Mechatron target manifest must select the intentional package and full test check'
+	fi
+fi
+
+assert_contains "$root/README.md" \
+	'[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Fchatscan.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)' \
+	'README must use the canonical dynamic Mechatron Prime badge'
+assert_not_contains "$root/README.md" \
+	'garnix' \
+	'README must not claim retired Garnix CI'
 
 if [[ -x "$root/test" ]]; then
 	fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/chatscan-ci-contract.XXXXXX")"

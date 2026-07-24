@@ -75,7 +75,7 @@
 						zig build \
 							${packageTargetFlag} \
 							-Dcpu=baseline \
-							-Doptimize=ReleaseSafe \
+							-Doptimize=ReleaseFast \
 							--color off
 					'';
 

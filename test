@@ -89,6 +89,13 @@ if [ "$no_build" -eq 0 ]; then
 		echo "build failed — aborting" >&2
 		exit 1
 	fi
+	echo "==> Verifying built package artifact…"
+	if bash tests/cli/package_artifact_test.sh; then
+		echo "    built package artifact: PASS"
+	else
+		echo "    built package artifact: FAIL" >&2
+		fails=$((fails + 1))
+	fi
 fi
 
 system="$(nix eval --raw --impure --expr builtins.currentSystem)"
