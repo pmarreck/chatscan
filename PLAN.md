@@ -6,9 +6,9 @@
   - Curiosity poke: are other generated hidden directories recursively misclassified even though root-level hidden files are already ignored?
 - [x] Reproduce `chatscan rg` failing because `zig-out/bin/chatscan` requests an unavailable musl loader, then add a persistent regression test and repair the build/install path — completed 2026-07-24 09:39 EDT.
   - Curiosity poke: can a cross-compiled artifact silently replace the host-native PATH binary after `build_all` or a Nix build?
-- [ ] Complete the Mechatron Prime CI integration: exact targets manifest, canonical dynamic README badge, webhook audit/provisioning, push, and live PASSING verification.
+- [x] Complete the Mechatron Prime CI integration: exact targets manifest, canonical dynamic README badge, webhook audit/provisioning, push, and live PASSING verification — completed 2026-07-24 09:57 EDT.
   - [x] Add and locally verify the exact package/check target set and canonical dynamic badge — completed 2026-07-24 09:47 EDT.
-  - [ ] Audit/provision the GitHub webhook, push `yolo`, and verify the public badge reaches `PASSING`.
+  - [x] Confirm the existing active webhook, push `yolo`, and verify exact commit `590184f` reaches `PASSING` — completed 2026-07-24 09:57 EDT.
   - Curiosity poke: does the exact pushed SHA expose both selected flake targets, and does the public badge follow that build rather than stale state?
 - [x] Add a failing CI-contract test for a real sandboxed suite — completed 2026-07-10 11:27 EDT (estimated).
   - Curiosity poke: can a check still pass by printing a success marker without executing Zig?
