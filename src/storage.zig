@@ -39,6 +39,15 @@ pub const IndexedFile = struct {
     }
 };
 
+pub const PendingEmbedding = struct {
+    rowid: i64,
+    content: []const u8,
+
+    pub fn deinit(self: *PendingEmbedding, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
+};
+
 pub const Message = struct {
     id: i64 = 0,
     file_path: []const u8 = "",
@@ -143,7 +152,8 @@ pub fn initSchema(allocator: std.mem.Allocator, db: Db, schema: Schema) !InitSch
     // sqlite-vec for embeddings
     const dim_str = try allocPrintZ(allocator, "{d}", .{schema.embedding_dim});
     defer allocator.free(dim_str);
-    const vec_sql = try allocPrintZ(allocator,
+    const vec_sql = try allocPrintZ(
+        allocator,
         "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vec0(embedding float[{d}])",
         .{schema.embedding_dim},
     );
@@ -365,6 +375,54 @@ pub fn getMessageCount(db: Db) i64 {
     return c.sqlite3_column_int64(stmt.?, 0);
 }
 
+/// Return the next ordered batch of lexical-only messages so semantic indexing
+/// can repair interrupted or previously unavailable embedding runs in O(n).
+pub fn getMessagesMissingEmbeddings(
+    db: Db,
+    allocator: std.mem.Allocator,
+    after_rowid: i64,
+    limit: usize,
+) ![]PendingEmbedding {
+    const sql =
+        \\SELECT m.id, m.content
+        \\FROM messages AS m
+        \\WHERE m.id > ?1
+        \\  AND NOT EXISTS (SELECT 1 FROM embeddings AS e WHERE e.rowid = m.id)
+        \\ORDER BY m.id
+        \\LIMIT ?2
+    ;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        logSqliteError(db, "prepare getMessagesMissingEmbeddings");
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+    const s = stmt.?;
+    bindInt(s, 1, after_rowid);
+    bindInt(s, 2, @intCast(limit));
+
+    var pending = std.ArrayListUnmanaged(PendingEmbedding).empty;
+    errdefer {
+        for (pending.items) |*item| item.deinit(allocator);
+        pending.deinit(allocator);
+    }
+    while (true) {
+        const step_result = c.sqlite3_step(s);
+        if (step_result == c.SQLITE_DONE) break;
+        if (step_result != c.SQLITE_ROW) {
+            logSqliteError(db, "step getMessagesMissingEmbeddings");
+            return error.QueryFailed;
+        }
+        const content = try allocator.dupe(u8, columnText(s, 1));
+        errdefer allocator.free(content);
+        try pending.append(allocator, .{
+            .rowid = c.sqlite3_column_int64(s, 0),
+            .content = content,
+        });
+    }
+    return pending.toOwnedSlice(allocator);
+}
+
 /// Get the message at line N±offset in the same file, for sandwich context display.
 pub fn getAdjacentMessage(db: Db, allocator: std.mem.Allocator, file_path: []const u8, line_number: i64, direction: enum { prev, next }) !?Message {
     const sql = switch (direction) {
@@ -561,6 +619,45 @@ test "insert and retrieve message" {
     });
     try std.testing.expect(rowid > 0);
     try std.testing.expectEqual(@as(i64, 1), getMessageCount(db));
+}
+
+test "missing embedding query classifies a mixed message set and paginates" {
+    const allocator = std.testing.allocator;
+    const db = try openMemoryWithVec(allocator);
+    defer close(db);
+
+    var result = try initSchema(allocator, db, .{ .embedding_dim = 2 });
+    defer result.deinit(allocator);
+
+    var rowids: [3]i64 = undefined;
+    const contents = [_][]const u8{ "missing first", "already embedded", "missing last" };
+    for (contents, 0..) |content, index| {
+        rowids[index] = try insertMessage(db, .{
+            .file_path = "mixed.jsonl",
+            .line_number = @intCast(index + 1),
+            .role = "user",
+            .content = content,
+        });
+    }
+    try insertEmbedding(db, allocator, rowids[1], &.{ 0.1, 0.2 });
+
+    const first_page = try getMessagesMissingEmbeddings(db, allocator, 0, 1);
+    defer {
+        for (first_page) |*item| item.deinit(allocator);
+        allocator.free(first_page);
+    }
+    try std.testing.expectEqual(@as(usize, 1), first_page.len);
+    try std.testing.expectEqual(rowids[0], first_page[0].rowid);
+    try std.testing.expectEqualStrings("missing first", first_page[0].content);
+
+    const second_page = try getMessagesMissingEmbeddings(db, allocator, first_page[0].rowid, 10);
+    defer {
+        for (second_page) |*item| item.deinit(allocator);
+        allocator.free(second_page);
+    }
+    try std.testing.expectEqual(@as(usize, 1), second_page.len);
+    try std.testing.expectEqual(rowids[2], second_page[0].rowid);
+    try std.testing.expectEqualStrings("missing last", second_page[0].content);
 }
 
 test "upsert and get indexed file" {

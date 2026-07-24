@@ -1,5 +1,7 @@
 # Plan
 
+- [x] Fix repeated `chatscan index` runs that report configured Ollama model `bge-m3` is loading without initiating or observing a load — completed 2026-07-24 11:11 EDT.
+  - Curiosity poke: does readiness confuse “installed but not resident,” “actively loading,” and “unavailable,” and can its advice actually advance each state?
 - [x] Reconcile the detached commit and `mechatron-ci-integration` into `yolo` without losing the exact staged cleanup — completed 2026-07-24 09:25 EDT (estimated).
   - Curiosity poke: do hidden `refs/jj/keep/*` contain unique trees that are absent from the reconciled history?
 - [x] Fix the shared memories skill so `.codescan/` search-index internals are ignored by title listing and frontmatter validation (blocks metadata recall) — completed 2026-07-24 09:29 EDT.

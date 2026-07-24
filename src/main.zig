@@ -454,7 +454,7 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
 }
 
 /// Build an Embedder for the configured backend, or return null if it's not
-/// available (Ollama not running, model loading, etc.). Adapter storage is
+/// available (Ollama not running, model unavailable, etc.). Adapter storage is
 /// provided by the caller so lifetimes match the HTTP client.
 fn setupEmbedder(
     allocator: std.mem.Allocator,
@@ -497,8 +497,13 @@ fn tryInitOllama(
 ) bool {
     ollama.ensureModelAvailable(allocator, http_client.transport(), ollama_url, ollama_model) catch |err| {
         switch (err) {
-            error.ModelLoading => {
-                _ = stderr.print("note: Ollama model '{s}' is loading. Re-run 'chatscan index' once loaded for embeddings.\n", .{ollama_model}) catch {};
+            error.ModelNotFound => {
+                _ = stderr.print("note: Ollama model '{s}' is not installed. Falling back to lexical search.\n", .{ollama_model}) catch {};
+                _ = stderr.flush() catch {};
+                return false;
+            },
+            error.ModelWarmupFailed => {
+                _ = stderr.print("note: Ollama model '{s}' is installed but could not be started. Falling back to lexical search.\n", .{ollama_model}) catch {};
                 _ = stderr.flush() catch {};
                 return false;
             },

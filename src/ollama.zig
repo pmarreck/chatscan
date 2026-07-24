@@ -149,10 +149,19 @@ pub fn ensureModelAvailable(
 	// Step 2: Check /api/ps — model loaded in memory? (fast path)
 	if (try isModelLoaded(allocator, transport, base_url, model_name)) return;
 
-	// Step 3: Model exists on disk but not loaded in memory.
-	// The next embed call will trigger loading, which can take minutes.
-	// Return immediately so callers can show a helpful message or fall back.
-	return error.ModelLoading;
+	// Step 3: An installed but idle Ollama model only starts when work is sent.
+	// A successful probe proves readiness instead of guessing that it is loading.
+	const probe_inputs = [_][]const u8{"chatscan readiness probe"};
+	const embeddings = embed(
+		allocator,
+		transport,
+		base_url,
+		model_name,
+		&probe_inputs,
+		900,
+	) catch return error.ModelWarmupFailed;
+	defer freeEmbeddings(allocator, embeddings);
+	if (embeddings.len != 1 or embeddings[0].len == 0) return error.ModelWarmupFailed;
 }
 
 /// Check if a model is currently loaded in memory via /api/ps.
@@ -357,18 +366,14 @@ test "embed uses live Ollama" {
 	const model = try runtime.envOrDefault(allocator, "OLLAMA_MODEL", "bge-large");
 	defer allocator.free(model);
 
-	ensureModelAvailable(allocator, transport.transport(), url, model) catch |err| switch (err) {
-		error.ModelLoading => {}, // Model exists, embed will trigger loading
-		else => return err,
-	};
+	try ensureModelAvailable(allocator, transport.transport(), url, model);
 
-	const inputs = [_][]const u8{ "hash functions" };
+	const inputs = [_][]const u8{"hash functions"};
 	const embeddings = try embed(allocator, transport.transport(), url, model, &inputs, null);
 	defer freeEmbeddings(allocator, embeddings);
 	try std.testing.expect(embeddings.len == 1);
 	try std.testing.expect(embeddings[0].len > 0);
 }
-
 
 /// A mock transport for unit tests — returns canned responses based on URL path.
 const MockTransportCtx = struct {
@@ -377,6 +382,7 @@ const MockTransportCtx = struct {
 	embed_should_fail: bool = false,
 	tags_calls: usize = 0,
 	ps_calls: usize = 0,
+	embed_calls: usize = 0,
 
 	fn send(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, req: HttpRequest) !HttpResponse {
 		const self: *MockTransportCtx = @ptrCast(@alignCast(ctx_ptr));
@@ -389,6 +395,7 @@ const MockTransportCtx = struct {
 			return .{ .status = 200, .body = try allocator.dupe(u8, self.ps_body) };
 		}
 		if (std.mem.endsWith(u8, req.url, "/api/embed")) {
+			self.embed_calls += 1;
 			if (self.embed_should_fail) return error.ConnectionRefused;
 			return .{ .status = 200, .body = try allocator.dupe(u8, "{\"embeddings\":[[0.1,0.2]]}") };
 		}
@@ -468,7 +475,7 @@ test "ensureModelAvailable succeeds when model is loaded in ps" {
 	try std.testing.expectEqual(@as(usize, 1), mock.ps_calls);
 }
 
-test "ensureModelAvailable returns ModelLoading when in tags but not ps and embed fails" {
+test "ensureModelAvailable reports failed warmup when installed model cannot start" {
 	const allocator = std.testing.allocator;
 	var mock = MockTransportCtx{
 		.tags_body =
@@ -480,12 +487,13 @@ test "ensureModelAvailable returns ModelLoading when in tags but not ps and embe
 		.embed_should_fail = true,
 	};
 	try std.testing.expectError(
-		error.ModelLoading,
+		error.ModelWarmupFailed,
 		ensureModelAvailable(allocator, mock.transport(), "http://localhost:11434", "bge-large"),
 	);
+	try std.testing.expectEqual(@as(usize, 1), mock.embed_calls);
 }
 
-test "ensureModelAvailable returns ModelLoading when in tags but not ps" {
+test "ensureModelAvailable warms installed model when not loaded" {
 	const allocator = std.testing.allocator;
 	var mock = MockTransportCtx{
 		.tags_body =
@@ -496,10 +504,8 @@ test "ensureModelAvailable returns ModelLoading when in tags but not ps" {
 		,
 		.embed_should_fail = false,
 	};
-	try std.testing.expectError(
-		error.ModelLoading,
-		ensureModelAvailable(allocator, mock.transport(), "http://localhost:11434", "bge-large"),
-	);
+	try ensureModelAvailable(allocator, mock.transport(), "http://localhost:11434", "bge-large");
+	try std.testing.expectEqual(@as(usize, 1), mock.embed_calls);
 }
 
 test "buildPsUrl handles trailing slash" {

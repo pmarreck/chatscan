@@ -9,6 +9,7 @@ pub const IndexStats = struct {
     files_scanned: usize = 0,
     files_indexed: usize = 0,
     messages_indexed: usize = 0,
+    embeddings_backfilled: usize = 0,
     files_deleted: usize = 0,
     embedding_failures: usize = 0,
 };
@@ -81,6 +82,22 @@ pub fn indexAllForLlm(
     defer embed_texts.deinit(allocator);
     var embed_rowids = std.ArrayListUnmanaged(i64).empty;
     defer embed_rowids.deinit(allocator);
+
+    if (embedder) |active_embedder| {
+        const backfill = try backfillMissingEmbeddings(
+            allocator,
+            db,
+            active_embedder,
+            batch_size,
+            stderr,
+        );
+        stats.embeddings_backfilled = backfill.indexed;
+        stats.embedding_failures += backfill.failed;
+        if (backfill.indexed > 0) {
+            _ = stderr.print("  backfilled {d} missing embeddings\n", .{backfill.indexed}) catch {};
+            _ = stderr.flush() catch {};
+        }
+    }
 
     for (files) |file_path| {
         try on_disk.put(file_path, {});
@@ -248,6 +265,83 @@ pub fn indexAllForLlm(
     return stats;
 }
 
+const BackfillStats = struct {
+    indexed: usize = 0,
+    failed: usize = 0,
+};
+
+fn renderBackfillProgress(buffer: []u8, stats: BackfillStats) ![]u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "  embedding repair: {d} processed ({d} stored, {d} failed)\n",
+        .{ stats.indexed + stats.failed, stats.indexed, stats.failed },
+    );
+}
+
+/// Repair lexical-only rows without reparsing unchanged conversation files by
+/// walking missing database rowids in bounded batches.
+fn backfillMissingEmbeddings(
+    allocator: std.mem.Allocator,
+    db: storage.Db,
+    embedder: embedding.Embedder,
+    configured_batch_size: usize,
+    stderr: *std.Io.Writer,
+) !BackfillStats {
+    const progress_interval: usize = 1000;
+    const batch_size = @max(configured_batch_size, 1);
+    var stats = BackfillStats{};
+    var after_rowid: i64 = 0;
+    var next_progress: usize = progress_interval;
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (texts.items) |text| allocator.free(text);
+        texts.deinit(allocator);
+    }
+    var rowids = std.ArrayListUnmanaged(i64).empty;
+    defer rowids.deinit(allocator);
+
+    while (true) {
+        const pending = try storage.getMessagesMissingEmbeddings(
+            db,
+            allocator,
+            after_rowid,
+            batch_size,
+        );
+        defer {
+            for (pending) |*item| item.deinit(allocator);
+            allocator.free(pending);
+        }
+        if (pending.len == 0) break;
+
+        for (pending) |item| {
+            after_rowid = item.rowid;
+            const content = item.content[0..@min(item.content.len, 1600)];
+            const owned_content = try allocator.dupe(u8, content);
+            texts.append(allocator, owned_content) catch |err| {
+                allocator.free(owned_content);
+                return err;
+            };
+            try rowids.append(allocator, item.rowid);
+        }
+
+        const attempted = rowids.items.len;
+        const failed = try flushEmbeddingBatch(allocator, db, embedder, &texts, &rowids);
+        stats.indexed += attempted - failed;
+        stats.failed += failed;
+
+        const processed = stats.indexed + stats.failed;
+        if (processed >= next_progress) {
+            var progress_buffer: [128]u8 = undefined;
+            const progress = try renderBackfillProgress(&progress_buffer, stats);
+            _ = stderr.writeAll(progress) catch {};
+            _ = stderr.flush() catch {};
+            next_progress = (processed / progress_interval + 1) * progress_interval;
+        }
+    }
+
+    return stats;
+}
+
 fn flushEmbeddingBatch(
     allocator: std.mem.Allocator,
     db: storage.Db,
@@ -384,7 +478,6 @@ test "indexAll counts embedding failures without losing FTS indexing" {
     try std.testing.expectEqual(@as(usize, 2), stats.embedding_failures);
 }
 
-
 // An embedder that returns correctly-sized vectors, to exercise the success path.
 const OkEmbedder = struct {
     fn embed(ctx: *anyopaque, allocator: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
@@ -404,6 +497,78 @@ const OkEmbedder = struct {
         allocator.free(embeddings);
     }
 };
+
+fn testEmbeddingCount(db: storage.Db) i64 {
+    const c = storage.sqlite;
+    const sql = "SELECT COUNT(*) FROM embeddings";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return -1;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(stmt.?, 0);
+}
+
+test "renderBackfillProgress reports processed succeeded and failed counts" {
+    var buffer: [128]u8 = undefined;
+    const rendered = try renderBackfillProgress(&buffer, .{
+        .indexed = 992,
+        .failed = 8,
+    });
+    try std.testing.expectEqualStrings(
+        "  embedding repair: 1000 processed (992 stored, 8 failed)\n",
+        rendered,
+    );
+}
+
+test "indexAll backfills embeddings for unchanged lexical-only messages" {
+    const allocator = std.testing.allocator;
+
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const conv_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-idx-backfill", .{tmpdir});
+    defer allocator.free(conv_dir);
+    const proj_dir = try std.fmt.allocPrint(allocator, "{s}/-Users-test-proj", .{conv_dir});
+    defer allocator.free(proj_dir);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/session.jsonl", .{proj_dir});
+    defer allocator.free(file_path);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), proj_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), file_path, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(),
+            \\{"type":"user","timestamp":"2026-03-06T12:00:00Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"first lexical-only message"}]}}
+            \\{"type":"user","timestamp":"2026-03-06T12:00:01Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"second lexical-only message"}]}}
+            \\
+        );
+    }
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var result = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer result.deinit(allocator);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
+
+    const lexical_stats = try indexAll(allocator, db, conv_dir, null, 16, false, &w.interface);
+    try std.testing.expectEqual(@as(usize, 2), lexical_stats.messages_indexed);
+    try std.testing.expectEqual(@as(i64, 0), testEmbeddingCount(db));
+
+    var dummy: u8 = 0;
+    const embedder = embedding.Embedder{
+        .ctx = @ptrCast(&dummy),
+        .embed = OkEmbedder.embed,
+        .free = OkEmbedder.free,
+    };
+    const backfill_stats = try indexAll(allocator, db, conv_dir, embedder, 16, false, &w.interface);
+    try std.testing.expectEqual(@as(usize, 0), backfill_stats.messages_indexed);
+    try std.testing.expectEqual(@as(usize, 2), backfill_stats.embeddings_backfilled);
+    try std.testing.expectEqual(@as(i64, 2), testEmbeddingCount(db));
+}
 
 test "indexAll indexes files across batch boundary and skips unchanged on reindex" {
     const allocator = std.testing.allocator;
