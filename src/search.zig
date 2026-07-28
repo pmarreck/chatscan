@@ -216,6 +216,30 @@ pub fn search(
         }
     }.lessThan);
 
+    // Collapse to the best-scoring message per conversation (F1). Results are
+    // sorted by score desc, so the FIRST time a conversation key is seen is its
+    // best message; later messages from the same conversation are dropped so the
+    // list surfaces DISTINCT conversations, not fragments of one. In-place
+    // compaction (write <= read always) avoids aliasing the payload pointers.
+    {
+        var seen_conv = std.StringHashMapUnmanaged(void){};
+        defer seen_conv.deinit(allocator);
+        var write: usize = 0;
+        for (results.items) |res| {
+            const key = res.message.session_id orelse res.message.file_path;
+            if (seen_conv.contains(key)) {
+                var tmp = res;
+                tmp.deinit(allocator); // drop duplicate conversation message
+            } else {
+                // On OOM, keep the item anyway (a stray duplicate beats a leak).
+                seen_conv.put(allocator, key, {}) catch {};
+                results.items[write] = res;
+                write += 1;
+            }
+        }
+        results.shrinkRetainingCapacity(write);
+    }
+
     // Score dropoff
     const total_relevant = blk: {
         if (results.items.len == 0) break :blk @as(usize, 0);
@@ -964,4 +988,39 @@ test "hybrid ranks an exact-term match above recent semantically-adjacent noise"
     try std.testing.expect(sr.results.len >= 1);
     // The exact-term match must be the #1 result, not buried under recent noise.
     try std.testing.expect(std.mem.indexOf(u8, sr.results[0].message.content, "ghostty") != null);
+}
+
+test "results are deduped to the best message per conversation" {
+    // F1: one conversation with many matching messages must not flood the
+    // result list — collapse to the single best-scoring message per session so
+    // N slots surface N distinct conversations.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // Conversation A: 5 matching messages in one file/session.
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try storage.insertMessage(db, .{
+            .file_path = "conv-a.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
+            .content = "alpha discussion about the alpha topic in depth", .timestamp = null,
+            .session_id = "sess-a", .project_name = "proj", .project_dir = "-x-proj",
+        });
+    }
+    // Conversation B: a single matching message.
+    _ = try storage.insertMessage(db, .{
+        .file_path = "conv-b.jsonl", .line_number = 1, .role = "assistant",
+        .content = "alpha appears here exactly once", .timestamp = null,
+        .session_id = "sess-b", .project_name = "proj", .project_dir = "-x-proj",
+    });
+
+    const sr = try search(allocator, db, null, "alpha", .{ .mode = .lexical, .top_n = 10 });
+    defer freeResults(allocator, sr.results);
+
+    // Two conversations -> exactly two results, not six.
+    try std.testing.expectEqual(@as(usize, 2), sr.results.len);
+    try std.testing.expect(!std.mem.eql(u8,
+        sr.results[0].message.session_id.?, sr.results[1].message.session_id.?));
 }
