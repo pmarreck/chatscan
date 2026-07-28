@@ -33,8 +33,8 @@ chatscan "config" --json
 ## Features
 
 - **Multi-LLM support** — indexes Claude (`~/.claude/projects/`), Codex (`~/.codex/sessions/`), and Gemini (`~/.gemini/tmp/`) conversations
-- **Hybrid search** — equally weighted semantic (vector), lexical (FTS5), and recency scoring
-- **Recency weighting** — recent conversations rank higher (exponential decay, 30-day half-life)
+- **Hybrid search** — semantic (vector), lexical (FTS5), and recency signals fused by **Reciprocal Rank Fusion** (RRF), which ranks by rank-position rather than combining incomparable raw scores, so a strong match in any one signal reliably surfaces
+- **Recency as a gentle tiebreaker** — recent conversations get a mild boost (a low-weight RRF ranker), not enough to bury an exact-term match under recent-but-irrelevant chatter
 - **Sandwich display** — matched message shown bold, with previous/next messages dimmed for context
 - **Auto-scoping (with escape hatches)** — searches are scoped to the current directory's project by default, and say so on stderr; use `--all` to search everything or `--project <name-or-partial-path>` to target another project
 - **Env-var overrides** — `CHATSCAN_DB` and `CHATSCAN_CONVERSATION_DIR` (plus `CHATSCAN_LLM`) override paths without flags; CLI flags override env vars override config

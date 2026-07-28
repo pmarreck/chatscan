@@ -1,5 +1,8 @@
 # Plan
 
+- [x] Fix hybrid search burying exact-term matches under recent-but-irrelevant conversations (the "Ghostty window" complaint): replace the weighted raw-score sum with **Reciprocal Rank Fusion** across vector+lexical+recency rankers; recency demoted to a low-weight tiebreaker; fixed the dedup bug that silently dropped a vector hit's lexical signal. Red test `hybrid ranks an exact-term match above recent semantically-adjacent noise` first, then green; dogfooded on the real index (top-8 went from unrelated `tiffz` to a coherent Ghostty set) — completed 2026-07-27 20:30 EDT.
+  - Curiosity poke: does RRF's tight score-clustering break the ratio-based `score_dropoff` gate?
+- [ ] Adversarial code review of the scoring algorithm to find OTHER flaws (Peter's request, post-fix): probe RRF edge cases, `score_dropoff` under RRF, recency-rank ties, null-timestamp handling, vector-candidate post-filter correctness, and per-message vs per-conversation ranking.
 - [x] Fix repeated `chatscan index` runs that report configured Ollama model `bge-m3` is loading without initiating or observing a load — completed 2026-07-24 11:11 EDT.
   - Curiosity poke: does readiness confuse “installed but not resident,” “actively loading,” and “unavailable,” and can its advice actually advance each state?
 - [x] Reconcile the detached commit and `mechatron-ci-integration` into `yolo` without losing the exact staged cleanup — completed 2026-07-24 09:25 EDT (estimated).

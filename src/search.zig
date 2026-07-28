@@ -23,9 +23,9 @@ pub const Options = struct {
     top_n: usize = 10,
     candidate_multiplier: usize = 5,
     mode: SearchMode = .hybrid,
-    weight_vector: f32 = 1.0 / 3.0,
-    weight_lexical: f32 = 1.0 / 3.0,
-    weight_recency: f32 = 1.0 / 3.0,
+    weight_vector: f32 = 1.0,
+    weight_lexical: f32 = 1.0,
+    weight_recency: f32 = 0.3,
     score_dropoff: f32 = 0.3,
     role_filter: ?[]const u8 = null,
     project_filter: ?[]const u8 = null,
@@ -33,6 +33,10 @@ pub const Options = struct {
     since: ?[]const u8 = null,
     until: ?[]const u8 = null,
 };
+
+/// Reciprocal Rank Fusion smoothing constant (Cormack et al. 2009). Larger k
+/// flattens the contribution of top ranks; 60 is the community-standard value.
+const rrf_k: f32 = 60.0;
 
 pub const Result = struct {
     id: i64,
@@ -80,6 +84,16 @@ pub fn search(
         results.deinit(allocator);
     }
 
+    // Reciprocal Rank Fusion (hybrid): remember each candidate's RANK in the
+    // vector and lexical rankers so hybrid fuses by rank POSITION (scale-free)
+    // rather than summing incomparable raw scores. A doc present in a ranker
+    // adds w/(k+rank); absent -> 0. This also fixes the old dedup bug where a
+    // vector hit's lexical signal was silently dropped.
+    var vrank = std.AutoHashMapUnmanaged(i64, usize){};
+    defer vrank.deinit(allocator);
+    var lrank = std.AutoHashMapUnmanaged(i64, usize){};
+    defer lrank.deinit(allocator);
+
     const limit = options.top_n * options.candidate_multiplier;
 
     if (options.mode == .lexical) {
@@ -95,7 +109,10 @@ pub fn search(
             if (embeddings.len != 1) return error.InvalidEmbeddingCount;
 
             const vector_results = try vectorCandidates(allocator, db, embeddings[0], limit);
-            for (vector_results) |res| try results.append(allocator, res);
+            for (vector_results, 0..) |res, rank| {
+                if (options.mode == .hybrid) try vrank.put(allocator, res.id, rank);
+                try results.append(allocator, res);
+            }
             allocator.free(vector_results);
 
             if (options.mode == .hybrid) {
@@ -106,7 +123,8 @@ pub fn search(
                 const lexical = try lexicalCandidates(allocator, db, query, limit, options);
                 defer allocator.free(lexical);
 
-                for (lexical) |res| {
+                for (lexical, 0..) |res, rank| {
+                    try lrank.put(allocator, res.id, rank);
                     if (seen.contains(res.id)) {
                         var tmp = res;
                         tmp.deinit(allocator);
@@ -156,15 +174,39 @@ pub fn search(
 
     // Score and sort
     const now_epoch: i64 = @intCast(@divFloor(std.Io.Timestamp.now(runtime.io(), .real).nanoseconds, std.time.ns_per_s));
-    for (results.items) |*res| {
-        const vec_score: f32 = if (res.distance >= 0) 1.0 / (1.0 + res.distance) else 0;
-        const lex_score: f32 = res.lexical;
-        const recency = computeRecencyScore(res.message.timestamp, now_epoch);
-        res.score = switch (options.mode) {
-            .lexical => lex_score,
-            .vector => vec_score,
-            .hybrid => weight_vector * vec_score + weight_lexical * lex_score + weight_recency * recency,
-        };
+    if (options.mode == .hybrid) {
+        // Recency is the third RRF ranker: rank survivors newest-first so it acts
+        // as a gentle, scale-free tiebreaker instead of a co-equal additive term
+        // that recent-but-irrelevant messages could win on outright.
+        const rec = try allocator.alloc(f32, results.items.len);
+        defer allocator.free(rec);
+        const order = try allocator.alloc(usize, results.items.len);
+        defer allocator.free(order);
+        for (results.items, 0..) |res, i| {
+            rec[i] = computeRecencyScore(res.message.timestamp, now_epoch);
+            order[i] = i;
+        }
+        std.mem.sortUnstable(usize, order, @as([]const f32, rec), struct {
+            fn lessThan(r: []const f32, a: usize, b: usize) bool {
+                return r[a] > r[b]; // newest (highest recency) first
+            }
+        }.lessThan);
+        for (order, 0..) |res_idx, recency_pos| {
+            const res = &results.items[res_idx];
+            var fused: f32 = 0;
+            if (vrank.get(res.id)) |r| fused += weight_vector / (rrf_k + @as(f32, @floatFromInt(r)));
+            if (lrank.get(res.id)) |r| fused += weight_lexical / (rrf_k + @as(f32, @floatFromInt(r)));
+            fused += weight_recency / (rrf_k + @as(f32, @floatFromInt(recency_pos)));
+            res.score = fused;
+        }
+    } else {
+        for (results.items) |*res| {
+            res.score = switch (options.mode) {
+                .lexical => res.lexical,
+                .vector => if (res.distance >= 0) 1.0 / (1.0 + res.distance) else 0,
+                .hybrid => unreachable,
+            };
+        }
     }
 
     // Sort by score descending
@@ -857,4 +899,69 @@ test "filtered search finds a target ranked beyond the FTS candidate limit" {
     defer freeResults(allocator, by_date.results);
     try std.testing.expectEqual(@as(usize, 1), by_date.results.len);
     try std.testing.expectEqualStrings("target", by_date.results[0].message.project_name.?);
+}
+
+test "hybrid ranks an exact-term match above recent semantically-adjacent noise" {
+    // Repro of the "Ghostty window" complaint: the ONE conversation that
+    // actually contains the query terms is old and a weak vector match, while
+    // several RECENT, semantically-adjacent-but-textually-irrelevant messages
+    // are strong vector hits. Hybrid must still surface the exact-term match
+    // first — a term the user typed and KNOWS is in a conversation must win.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // 8 recent noise rows: no query terms, embedding == query vector (distance 0).
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const rowid = try storage.insertMessage(db, .{
+            .file_path = "noise.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
+            .content = "quarterly zebra migration patterns across the savanna",
+            .timestamp = "2026-07-26T00:00:00Z", .session_id = null,
+            .project_name = "noise", .project_dir = "-x-noise",
+        });
+        var vec: [1024]f32 = undefined;
+        for (&vec) |*e| e.* = 1.0; // identical to the query vector -> distance 0
+        try storage.insertEmbedding(db, allocator, rowid, &vec);
+    }
+
+    // 1 old target row: contains BOTH query terms, embedding far from query.
+    const target = try storage.insertMessage(db, .{
+        .file_path = "dotfiles.jsonl", .line_number = 1, .role = "assistant",
+        .content = "to make the ghostty window start out wider set window-width on startup",
+        .timestamp = "2026-01-01T00:00:00Z", .session_id = null,
+        .project_name = "dotfiles", .project_dir = "-x-dotfiles",
+    });
+    var tvec: [1024]f32 = undefined;
+    for (&tvec) |*e| e.* = 0.0; // far from the all-ones query vector
+    try storage.insertEmbedding(db, allocator, target, &tvec);
+
+    // Mock embedder: query "ghostty window" -> all-ones vector (matches noise).
+    const MockEmb = struct {
+        buf: [1024]f32,
+        fn embed(ctx: *anyopaque, alloc: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const out = try alloc.alloc([]f32, inputs.len);
+            for (out) |*o| o.* = try alloc.dupe(f32, &self.buf);
+            return out;
+        }
+        fn free(ctx: *anyopaque, alloc: std.mem.Allocator, embs: [][]f32) void {
+            _ = ctx;
+            for (embs) |e| alloc.free(e);
+            alloc.free(embs);
+        }
+    };
+    var qvec: [1024]f32 = undefined;
+    for (&qvec) |*e| e.* = 1.0;
+    var mock = MockEmb{ .buf = qvec };
+    const embedder = embedding.Embedder{ .ctx = @ptrCast(&mock), .embed = MockEmb.embed, .free = MockEmb.free };
+
+    const sr = try search(allocator, db, embedder, "ghostty window", .{ .mode = .hybrid, .top_n = 5 });
+    defer freeResults(allocator, sr.results);
+
+    try std.testing.expect(sr.results.len >= 1);
+    // The exact-term match must be the #1 result, not buried under recent noise.
+    try std.testing.expect(std.mem.indexOf(u8, sr.results[0].message.content, "ghostty") != null);
 }
