@@ -385,10 +385,24 @@ fn lexicalCandidates(
     limit: usize,
     options: Options,
 ) ![]Result {
-    // Try FTS5 first
-    const fts_results = try ftsCandidates(allocator, db, query, limit, options);
-    if (fts_results.len > 0) return fts_results;
-    allocator.free(fts_results);
+    // Conjunctive first (F4): require ALL query terms so a common single word
+    // (e.g. "window") can't flood the pool. Fall back to disjunctive (OR) only
+    // when the conjunction finds nothing, preserving recall; then LIKE.
+    const and_q = try buildFtsQuery(allocator, query, true);
+    defer allocator.free(and_q);
+    var fts = try ftsCandidates(allocator, db, and_q, limit, options);
+    if (fts.len == 0) {
+        allocator.free(fts);
+        const or_q = try buildFtsQuery(allocator, query, false);
+        defer allocator.free(or_q);
+        // Single-token queries produce identical AND/OR text — don't re-run.
+        fts = if (std.mem.eql(u8, and_q, or_q))
+            try allocator.alloc(Result, 0)
+        else
+            try ftsCandidates(allocator, db, or_q, limit, options);
+    }
+    if (fts.len > 0) return fts;
+    allocator.free(fts);
 
     // Fall back to LIKE
     return likeCandidates(allocator, db, query, limit, options);
@@ -397,7 +411,7 @@ fn lexicalCandidates(
 fn ftsCandidates(
     allocator: std.mem.Allocator,
     db: storage.Db,
-    query: []const u8,
+    fts_query: []const u8,
     limit: usize,
     options: Options,
 ) ![]Result {
@@ -423,9 +437,6 @@ fn ftsCandidates(
     defer _ = sqlite.sqlite3_finalize(stmt);
     const s = stmt.?;
 
-    // Build FTS query: OR all tokens for broad matching
-    const fts_query = try buildFtsQuery(allocator, query);
-    defer allocator.free(fts_query);
     const proj_pat = if (options.project_filter) |pf| try projectLikePattern(allocator, pf) else null;
     defer if (proj_pat) |pp| allocator.free(pp);
 
@@ -534,7 +545,7 @@ fn likeCandidates(
     return results.toOwnedSlice(allocator);
 }
 
-fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![:0]u8 {
+fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8, conjunctive: bool) ![:0]u8 {
     // Tokenize query and join with OR for broad matching
     var tokens = std.ArrayListUnmanaged([]const u8).empty;
     defer tokens.deinit(allocator);
@@ -553,8 +564,9 @@ fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![:0]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
+    const join_op = if (conjunctive) " AND " else " OR ";
     for (tokens.items, 0..) |token, idx| {
-        if (idx > 0) try out.writer.writeAll(" OR ");
+        if (idx > 0) try out.writer.writeAll(join_op);
         try out.writer.print("\"{s}\"", .{token});
     }
 
@@ -677,14 +689,14 @@ pub fn freeResults(allocator: std.mem.Allocator, results: []Result) void {
 
 test "buildFtsQuery" {
     const allocator = std.testing.allocator;
-    const q = try buildFtsQuery(allocator, "SIMD optimization");
+    const q = try buildFtsQuery(allocator, "SIMD optimization", false);
     defer allocator.free(q);
     try std.testing.expectEqualStrings("\"SIMD\" OR \"optimization\"", q);
 }
 
 test "buildFtsQuery single token" {
     const allocator = std.testing.allocator;
-    const q = try buildFtsQuery(allocator, "hello");
+    const q = try buildFtsQuery(allocator, "hello", false);
     defer allocator.free(q);
     try std.testing.expectEqualStrings("\"hello\"", q);
 }
@@ -1023,4 +1035,48 @@ test "results are deduped to the best message per conversation" {
     try std.testing.expectEqual(@as(usize, 2), sr.results.len);
     try std.testing.expect(!std.mem.eql(u8,
         sr.results[0].message.session_id.?, sr.results[1].message.session_id.?));
+}
+
+test "multi-term lexical search requires all terms, with OR fallback" {
+    // F4: "ghostty window" should require BOTH terms so docs with only the
+    // common word "window" don't dilute the pool — but fall back to OR when the
+    // conjunction finds nothing, preserving recall.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    _ = try storage.insertMessage(db, .{
+        .file_path = "both.jsonl", .line_number = 1, .role = "assistant",
+        .content = "the ghostty window can start out wider", .timestamp = null,
+        .session_id = "s-both", .project_name = "p", .project_dir = "-x-p",
+    });
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try storage.insertMessage(db, .{
+            .file_path = "wonly.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
+            .content = "resize the window to fit the window pane window", .timestamp = null,
+            .session_id = "s-wonly", .project_name = "p", .project_dir = "-x-p",
+        });
+    }
+
+    // AND semantics: only the both-terms conversation matches (not window-only).
+    const both = try search(allocator, db, null, "ghostty window", .{ .mode = .lexical, .top_n = 10 });
+    defer freeResults(allocator, both.results);
+    try std.testing.expectEqual(@as(usize, 1), both.results.len);
+    try std.testing.expectEqualStrings("s-both", both.results[0].message.session_id.?);
+
+    // OR fallback: a term nothing pairs with still finds the partial match.
+    const fb = try search(allocator, db, null, "ghostty zzqqnope", .{ .mode = .lexical, .top_n = 10 });
+    defer freeResults(allocator, fb.results);
+    try std.testing.expectEqual(@as(usize, 1), fb.results.len);
+    try std.testing.expectEqualStrings("s-both", fb.results[0].message.session_id.?);
+}
+
+test "buildFtsQuery conjunctive joins tokens with AND" {
+    const allocator = std.testing.allocator;
+    const q = try buildFtsQuery(allocator, "ghostty window", true);
+    defer allocator.free(q);
+    try std.testing.expectEqualStrings("\"ghostty\" AND \"window\"", q);
 }
