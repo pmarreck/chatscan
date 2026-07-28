@@ -7,7 +7,7 @@
 - [x] F2: recalibrate `score_dropoff` for RRF — done 2026-07-27 21:47 EDT. Hybrid cuts at a fixed fraction of the theoretical-max fused score (1/rrf_k), top_n-stable; total_relevant converges (~25) instead of growing with --top (was 64+).
 - [x] F3: filtered vector search via scalar-distance full scan (vec_distance_l2) — done 2026-07-27 21:33 EDT.
 - [x] F4: conjunctive (AND) multi-term FTS with OR fallback — done 2026-07-27 21:22 EDT.
-- [ ] F7 (found during F2 work): --mode lexical ranking is INVERTED — normalized bm25 = 1/(1+abs(raw)) gives stronger matches a SMALLER score, so lexical mode sorts weakest-first. Hybrid unaffected (uses SQL rank order). Verify with a failing test, then fix.
+- [x] F7 (found during F2 work): fixed inverted --mode lexical ranking — normalize on bm25 MAGNITUDE (|bm25|/(1+|bm25|)) so stronger matches score higher. Red test confirmed weakest-first, green after. Done 2026-07-27 21:50 EDT.
 - [x] Fix repeated `chatscan index` runs that report configured Ollama model `bge-m3` is loading without initiating or observing a load — completed 2026-07-24 11:11 EDT.
   - Curiosity poke: does readiness confuse “installed but not resident,” “actively loading,” and “unavailable,” and can its advice actually advance each state?
 - [x] Reconcile the detached commit and `mechatron-ci-integration` into `yolo` without losing the exact staged cleanup — completed 2026-07-24 09:25 EDT (estimated).
