@@ -240,19 +240,23 @@ pub fn search(
         results.shrinkRetainingCapacity(write);
     }
 
-    // Score dropoff
+    // Score dropoff: how many results are worth showing. RRF scores are tightly
+    // compressed (each a small w/(k+rank)), so a top-relative cut (top*ratio)
+    // admits nearly the whole candidate pool and inflates with --top. For hybrid
+    // we instead cut at a fixed fraction of the THEORETICAL max fused score
+    // (weights sum to 1 after normalization, so max = 1/rrf_k) — an absolute,
+    // top_n-stable relevance floor. Raw lexical/vector scores rarely approach
+    // 1.0, so those keep the top-relative cut.
     const total_relevant = blk: {
         if (results.items.len == 0) break :blk @as(usize, 0);
-        const top_score = results.items[0].score;
-        const threshold = top_score * options.score_dropoff;
-        var count: usize = results.items.len;
-        for (results.items, 0..) |res, idx| {
-            if (res.score < threshold) {
-                count = idx;
-                break;
-            }
-        }
-        break :blk count;
+        const threshold: f32 = switch (options.mode) {
+            .hybrid => options.score_dropoff / rrf_k,
+            else => results.items[0].score * options.score_dropoff,
+        };
+        const scores = try allocator.alloc(f32, results.items.len);
+        defer allocator.free(scores);
+        for (results.items, 0..) |res, i| scores[i] = res.score;
+        break :blk relevantCount(scores, threshold);
     };
 
     // Trim to top_n
@@ -683,6 +687,17 @@ pub fn dateInRange(timestamp: ?[]const u8, since: ?[]const u8, until: ?[]const u
 }
 
 
+
+/// Number of results worth showing (F2): those scoring at or above `threshold`,
+/// with `scores` sorted descending. The caller picks the threshold per mode so
+/// the "N relevant" count means the same whether scores are raw (lexical/vector,
+/// ~[0,1]) or the tightly-compressed RRF band.
+fn relevantCount(scores: []const f32, threshold: f32) usize {
+    for (scores, 0..) |sc, idx| {
+        if (sc < threshold) return idx;
+    }
+    return scores.len;
+}
 
 /// Compute a recency score from 0.0 (ancient) to 1.0 (now).
 /// Uses exponential decay with a half-life of 30 days.
@@ -1181,4 +1196,19 @@ test "vector search with a project filter finds a target ranked beyond the KNN l
     defer freeResults(allocator, sr.results);
     try std.testing.expectEqual(@as(usize, 1), sr.results.len);
     try std.testing.expectEqualStrings("target", sr.results[0].message.project_name.?);
+}
+
+test "relevantCount counts scores at or above the threshold" {
+    const scores = [_]f32{ 0.013, 0.010, 0.006, 0.005, 0.004 };
+    try std.testing.expectEqual(@as(usize, 3), relevantCount(&scores, 0.006));
+    try std.testing.expectEqual(@as(usize, 5), relevantCount(&scores, 0.004));
+    try std.testing.expectEqual(@as(usize, 0), relevantCount(&scores, 0.02));
+    try std.testing.expectEqual(@as(usize, 0), relevantCount(&[_]f32{}, 0.5));
+    try std.testing.expectEqual(@as(usize, 1), relevantCount(&[_]f32{0.9}, 0.5));
+
+    // Hybrid's absolute floor is top_n-stable: the same threshold over a longer
+    // candidate list keeps the same prefix (extra low tail is simply excluded).
+    const short = [_]f32{ 0.013, 0.010, 0.006 };
+    const long = [_]f32{ 0.013, 0.010, 0.006, 0.004, 0.003, 0.002 };
+    try std.testing.expectEqual(relevantCount(&short, 0.005), relevantCount(&long, 0.005));
 }
