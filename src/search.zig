@@ -499,8 +499,11 @@ fn ftsCandidates(
 
     while (sqlite.sqlite3_step(s) == sqlite.SQLITE_ROW) {
         const raw_bm25 = sqlite.sqlite3_column_double(s, 9);
-        // FTS5 bm25 is negative (lower = better); normalize to 0-1
-        const normalized: f32 = @floatCast(1.0 / (1.0 + @abs(raw_bm25)));
+        // FTS5 bm25 is negative and MORE negative = better, so normalize on the
+        // MAGNITUDE: a stronger match (larger |bm25|) must map to a HIGHER score
+        // in (0,1). The old 1/(1+|bm25|) inverted this (stronger -> smaller).
+        const abs_bm25 = @abs(raw_bm25);
+        const normalized: f32 = @floatCast(abs_bm25 / (1.0 + abs_bm25));
 
         try results.append(allocator, .{
             .id = sqlite.sqlite3_column_int64(s, 0),
@@ -1211,4 +1214,32 @@ test "relevantCount counts scores at or above the threshold" {
     const short = [_]f32{ 0.013, 0.010, 0.006 };
     const long = [_]f32{ 0.013, 0.010, 0.006, 0.004, 0.003, 0.002 };
     try std.testing.expectEqual(relevantCount(&short, 0.005), relevantCount(&long, 0.005));
+}
+
+test "lexical mode ranks a stronger match above a weaker one" {
+    // F7: normalized bm25 must INCREASE with match strength. A doc with many
+    // occurrences of the term (more-negative raw bm25 = better) must rank ABOVE
+    // a doc with a single occurrence among many words. The old normalization
+    // 1/(1+abs(bm25)) inverted this (stronger match -> smaller score).
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    _ = try storage.insertMessage(db, .{
+        .file_path = "strong.jsonl", .line_number = 1, .role = "assistant",
+        .content = "widget widget widget widget widget", .timestamp = null,
+        .session_id = "s-strong", .project_name = "p", .project_dir = "-x-p",
+    });
+    _ = try storage.insertMessage(db, .{
+        .file_path = "weak.jsonl", .line_number = 1, .role = "assistant",
+        .content = "widget appears just once among many other unrelated words here today", .timestamp = null,
+        .session_id = "s-weak", .project_name = "p", .project_dir = "-x-p",
+    });
+
+    const sr = try search(allocator, db, null, "widget", .{ .mode = .lexical, .top_n = 10 });
+    defer freeResults(allocator, sr.results);
+    try std.testing.expectEqual(@as(usize, 2), sr.results.len);
+    try std.testing.expectEqualStrings("s-strong", sr.results[0].message.session_id.?);
 }

@@ -3,10 +3,11 @@
 - [x] Fix hybrid search burying exact-term matches under recent-but-irrelevant conversations (the "Ghostty window" complaint): replace the weighted raw-score sum with **Reciprocal Rank Fusion** across vector+lexical+recency rankers; recency demoted to a low-weight tiebreaker; fixed the dedup bug that silently dropped a vector hit's lexical signal. Red test `hybrid ranks an exact-term match above recent semantically-adjacent noise` first, then green; dogfooded on the real index (top-8 went from unrelated `tiffz` to a coherent Ghostty set) — completed 2026-07-27 20:30 EDT.
   - Curiosity poke: does RRF's tight score-clustering break the ratio-based `score_dropoff` gate?
 - [x] Adversarial code review of the scoring algorithm — completed 2026-07-27 21:16 EDT. Found F1 (one conversation floods 7/10 slots), F2 (`score_dropoff` a no-op under RRF), F3 (vector candidates bypass filter pushdown), F4 (multi-term FTS ORs tokens). Peter chose to fix all four.
-- [ ] F1: dedup search results to the best message per conversation (session).
-- [ ] F2: recalibrate `score_dropoff` for RRF's compressed score band.
-- [ ] F3: push --project/--date/--role into the vector KNN query + over-fetch under filters.
-- [ ] F4: conjunctive (AND) multi-term FTS with OR fallback when too few hits.
+- [x] F1: dedup to best message per conversation — done 2026-07-27 21:20 EDT. Real index: "Ghostty window" top-10 now 10 DISTINCT conversations (was 7 fragments of one).
+- [x] F2: recalibrate `score_dropoff` for RRF — done 2026-07-27 21:47 EDT. Hybrid cuts at a fixed fraction of the theoretical-max fused score (1/rrf_k), top_n-stable; total_relevant converges (~25) instead of growing with --top (was 64+).
+- [x] F3: filtered vector search via scalar-distance full scan (vec_distance_l2) — done 2026-07-27 21:33 EDT.
+- [x] F4: conjunctive (AND) multi-term FTS with OR fallback — done 2026-07-27 21:22 EDT.
+- [ ] F7 (found during F2 work): --mode lexical ranking is INVERTED — normalized bm25 = 1/(1+abs(raw)) gives stronger matches a SMALLER score, so lexical mode sorts weakest-first. Hybrid unaffected (uses SQL rank order). Verify with a failing test, then fix.
 - [x] Fix repeated `chatscan index` runs that report configured Ollama model `bge-m3` is loading without initiating or observing a load — completed 2026-07-24 11:11 EDT.
   - Curiosity poke: does readiness confuse “installed but not resident,” “actively loading,” and “unavailable,” and can its advice actually advance each state?
 - [x] Reconcile the detached commit and `mechatron-ci-integration` into `yolo` without losing the exact staged cleanup — completed 2026-07-24 09:25 EDT (estimated).
