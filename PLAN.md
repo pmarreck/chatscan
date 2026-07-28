@@ -1,5 +1,8 @@
 # Plan
 
+- [ ] Exclude observer/meta noise from chatscan: configurable ignore-list, default-skip the claude-mem observer-sessions dir (index-time skip + purge existing rows). Files stay on disk (still mineable).
+- [ ] Show LLM source (claude/codex/gemini) on each search hit, derived from file_path prefix (no schema change).
+- [ ] (future / separate) Evaluate mining the 151 claude-mem observer-sessions (Jun28-Jul6, ~1.5M tokens of typed <observation> records) as source material for the memories skill. Needs curation.
 - [x] Fix hybrid search burying exact-term matches under recent-but-irrelevant conversations (the "Ghostty window" complaint): replace the weighted raw-score sum with **Reciprocal Rank Fusion** across vector+lexical+recency rankers; recency demoted to a low-weight tiebreaker; fixed the dedup bug that silently dropped a vector hit's lexical signal. Red test `hybrid ranks an exact-term match above recent semantically-adjacent noise` first, then green; dogfooded on the real index (top-8 went from unrelated `tiffz` to a coherent Ghostty set) — completed 2026-07-27 20:30 EDT.
   - Curiosity poke: does RRF's tight score-clustering break the ratio-based `score_dropoff` gate?
 - [x] Adversarial code review of the scoring algorithm — completed 2026-07-27 21:16 EDT. Found F1 (one conversation floods 7/10 slots), F2 (`score_dropoff` a no-op under RRF), F3 (vector candidates bypass filter pushdown), F4 (multi-term FTS ORs tokens). Peter chose to fix all four.

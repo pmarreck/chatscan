@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const search = @import("search.zig");
 const storage = @import("storage.zig");
+const config = @import("config.zig");
 
 pub const OutputOptions = struct {
     use_color: bool = true,
@@ -55,6 +56,11 @@ fn writeHuman(
             try writer.writeAll(" ");
             try writeColored(writer, options.use_color, "\x1b[36m", pn);
         }
+        // LLM provenance tag (derived from the file path).
+        const src = config.LlmSource.fromPath(res.message.file_path).label();
+        if (options.use_color) try writer.writeAll("\x1b[2m");
+        try writer.print(" [{s}]", .{src});
+        if (options.use_color) try writer.writeAll("\x1b[0m");
 
         if (options.use_color) try writer.writeAll("\x1b[2m");
         try writer.print("  score {d:.3}", .{res.score});
@@ -152,6 +158,7 @@ fn writeJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, results: []co
         session_id: ?[]const u8,
         project_name: ?[]const u8,
         project_dir: ?[]const u8,
+        source: []const u8,
         score: f32,
         distance: f32,
         lexical: f32,
@@ -177,6 +184,7 @@ fn writeJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, results: []co
             .session_id = res.message.session_id,
             .project_name = res.message.project_name,
             .project_dir = res.message.project_dir,
+            .source = config.LlmSource.fromPath(res.message.file_path).label(),
             .score = res.score,
             .distance = res.distance,
             .lexical = res.lexical,

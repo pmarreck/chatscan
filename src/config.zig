@@ -28,6 +28,26 @@ pub const LlmSource = enum {
         if (std.mem.eql(u8, value, "all")) return .all;
         return error.InvalidLlmSource;
     }
+
+    /// Infer the origin CLI from a conversation file path (provenance for
+    /// display). Claude lives under `.claude/projects`, Codex under
+    /// `.codex/sessions`, Gemini under `.gemini/tmp`; unknown paths default to
+    /// claude (the historical single source).
+    pub fn fromPath(file_path: []const u8) LlmSource {
+        if (std.mem.indexOf(u8, file_path, "/.codex/") != null) return .codex;
+        if (std.mem.indexOf(u8, file_path, "/.gemini/") != null) return .gemini;
+        return .claude;
+    }
+
+    /// Short lowercase label for display/JSON (e.g. "claude").
+    pub fn label(self: LlmSource) []const u8 {
+        return switch (self) {
+            .claude => "claude",
+            .codex => "codex",
+            .gemini => "gemini",
+            .all => "all",
+        };
+    }
 };
 
 pub const Config = struct {
@@ -256,4 +276,19 @@ test "defaultDbPath returns expected path" {
     const path = try defaultDbPath(allocator);
     defer allocator.free(path);
     try std.testing.expect(std.mem.endsWith(u8, path, "/chatscan/index.sqlite3"));
+}
+
+test "LlmSource.fromPath classifies origin CLI over a set of paths" {
+    const home = "/home/pmarreck";
+    // A SET: each source's real path shape, plus the meta observer dir (still claude).
+    try std.testing.expectEqual(LlmSource.claude, LlmSource.fromPath(home ++ "/.claude/projects/-x-proj/abc.jsonl"));
+    try std.testing.expectEqual(LlmSource.codex, LlmSource.fromPath(home ++ "/.codex/sessions/2026/xyz.jsonl"));
+    try std.testing.expectEqual(LlmSource.gemini, LlmSource.fromPath(home ++ "/.gemini/tmp/hash/logs.json"));
+    // Observer sessions live under .claude/projects -> claude, not a new source.
+    try std.testing.expectEqual(LlmSource.claude, LlmSource.fromPath(home ++ "/.claude/projects/-home-pmarreck--claude-mem-observer-sessions/s.jsonl"));
+    // Unknown layout defaults to claude.
+    try std.testing.expectEqual(LlmSource.claude, LlmSource.fromPath("relative/path.jsonl"));
+    // Labels round-trip through parse.
+    try std.testing.expectEqualStrings("codex", LlmSource.codex.label());
+    try std.testing.expectEqual(LlmSource.gemini, try LlmSource.parse(LlmSource.gemini.label()));
 }

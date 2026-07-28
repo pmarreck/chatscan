@@ -152,6 +152,13 @@ assert_eq 0 "$(count html --all --date 2026-03-03)" "--date 2026-03-03 (gamma da
 date_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --since 2026-13-99 2>&1 >/dev/null)"
 assert_contains "$date_err" "YYYY-MM-DD" "an invalid --since date reports a clear format error"
 
+# --- LLM source provenance tag (F: derive from file_path) --------------------
+src_json="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --all --mode lexical --json 2>/dev/null | jq -r ".results[0].source")"
+assert_eq "claude" "$src_json" "json output tags each hit with source=claude (fixtures live under a claude-style path)"
+
+src_human="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --all --mode lexical 2>/dev/null)"
+assert_contains "$src_human" "[claude]" "human output shows the [claude] source tag"
+
 # --- Summary -----------------------------------------------------------------
 echo
 if [ "$FAILS" -eq 0 ]; then
