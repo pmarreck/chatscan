@@ -108,7 +108,7 @@ pub fn search(
             defer emb.free(emb.ctx, allocator, embeddings);
             if (embeddings.len != 1) return error.InvalidEmbeddingCount;
 
-            const vector_results = try vectorCandidates(allocator, db, embeddings[0], limit);
+            const vector_results = try vectorCandidates(allocator, db, embeddings[0], limit, options);
             for (vector_results, 0..) |res, rank| {
                 if (options.mode == .hybrid) try vrank.put(allocator, res.id, rank);
                 try results.append(allocator, res);
@@ -143,7 +143,7 @@ pub fn search(
     }
 
     // Apply filters
-    if (options.role_filter != null or options.project_filter != null or options.project_dir_filter != null or options.since != null or options.until != null) {
+    if (anyFilterActive(options)) {
         var filtered = std.ArrayListUnmanaged(Result).empty;
         for (results.items) |res| {
             var keep = true;
@@ -271,29 +271,66 @@ fn vectorCandidates(
     db: storage.Db,
     query_vec: []const f32,
     limit: usize,
+    options: Options,
 ) ![]Result {
     const json = try storage.vectorToJson(allocator, query_vec);
     defer allocator.free(json);
 
-    const sql =
+    // F3: sqlite-vec's KNN (MATCH + k) accepts NO metadata predicate, so a
+    // filtered match ranked past the small candidate limit would be cut before
+    // any Zig post-filter sees it. When a filter is active, use a scalar-
+    // distance FULL SCAN instead (vec_distance_l2), which lets us push the
+    // metadata WHERE + ORDER BY + LIMIT into SQL and rank the filtered subset
+    // correctly. Unfiltered searches keep the fast KNN path.
+    const filtered = anyFilterActive(options);
+    var sqlbuf: std.Io.Writer.Allocating = .init(allocator);
+    defer sqlbuf.deinit();
+    try sqlbuf.writer.writeAll(
         \\SELECT m.id, m.file_path, m.line_number, m.role, m.content,
         \\       m.timestamp, m.session_id, m.project_name, m.project_dir,
-        \\       e.distance
-        \\FROM embeddings AS e
-        \\JOIN messages AS m ON e.rowid = m.id
-        \\WHERE e.embedding MATCH vec_f32(?1) AND k = ?2
-        \\ORDER BY e.distance
-    ;
+    );
+    if (filtered) {
+        try sqlbuf.writer.writeAll(
+            \\       vec_distance_l2(e.embedding, vec_f32(?)) AS distance
+            \\FROM embeddings AS e
+            \\JOIN messages AS m ON e.rowid = m.id
+            \\WHERE 1 = 1
+        );
+        try appendFilterClauses(&sqlbuf.writer, "m.", options);
+        try sqlbuf.writer.writeAll("\nORDER BY distance\nLIMIT ?");
+    } else {
+        try sqlbuf.writer.writeAll(
+            \\       e.distance
+            \\FROM embeddings AS e
+            \\JOIN messages AS m ON e.rowid = m.id
+            \\WHERE e.embedding MATCH vec_f32(?) AND k = ?
+            \\ORDER BY e.distance
+        );
+    }
+    const sql = try sqlbuf.toOwnedSlice();
+    defer allocator.free(sql);
 
     var stmt: ?*sqlite.sqlite3_stmt = null;
-    if (sqlite.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != sqlite.SQLITE_OK) {
+    if (sqlite.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != sqlite.SQLITE_OK) {
         return allocator.alloc(Result, 0);
     }
     defer _ = sqlite.sqlite3_finalize(stmt);
     const s = stmt.?;
 
+    // proj_pat must outlive sqlite3_step (bound text is referenced, not copied).
+    const proj_pat = if (filtered)
+        (if (options.project_filter) |pf| try projectLikePattern(allocator, pf) else null)
+    else
+        null;
+    defer if (proj_pat) |pp| allocator.free(pp);
+
     storage.bindTextPub(s, 1, json);
-    _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
+    if (filtered) {
+        const limit_idx = bindActiveFilters(s, 2, options, proj_pat);
+        _ = sqlite.sqlite3_bind_int(s, limit_idx, @intCast(limit));
+    } else {
+        _ = sqlite.sqlite3_bind_int(s, 2, @intCast(limit));
+    }
 
     var results = std.ArrayListUnmanaged(Result).empty;
     errdefer {
@@ -341,6 +378,12 @@ fn projectLikePattern(allocator: std.mem.Allocator, filter: []const u8) ![]u8 {
 /// ("m." for joined queries, "" for the bare messages table). The emit order
 /// MUST match bindActiveFilters. These narrow the candidate set BEFORE LIMIT;
 /// the exact Zig filter pass still runs, so results are unchanged in content.
+/// True when any metadata filter (role/project/date) is active.
+fn anyFilterActive(o: Options) bool {
+    return o.role_filter != null or o.project_filter != null or
+        o.project_dir_filter != null or o.since != null or o.until != null;
+}
+
 fn appendFilterClauses(w: *std.Io.Writer, prefix: []const u8, o: Options) !void {
     if (o.role_filter != null) try w.print(" AND {s}role = ?", .{prefix});
     if (o.since != null) try w.print(" AND substr({s}timestamp, 1, 10) >= ?", .{prefix});
@@ -1079,4 +1122,63 @@ test "buildFtsQuery conjunctive joins tokens with AND" {
     const q = try buildFtsQuery(allocator, "ghostty window", true);
     defer allocator.free(q);
     try std.testing.expectEqualStrings("\"ghostty\" AND \"window\"", q);
+}
+
+test "vector search with a project filter finds a target ranked beyond the KNN limit" {
+    // F3: vectorCandidates fetched only the top-`limit` nearest, then filtered
+    // in Zig — so a filtered match ranked past that limit was silently lost.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    // 20 NEAR-but-wrong-project noise rows (embedding == query vector).
+    var n: usize = 0;
+    while (n < 20) : (n += 1) {
+        const rid = try storage.insertMessage(db, .{
+            .file_path = "noise.jsonl", .line_number = @intCast(n + 1), .role = "assistant",
+            .content = "near noise", .timestamp = null, .session_id = null,
+            .project_name = "noise", .project_dir = "-x-noise",
+        });
+        var v: [1024]f32 = undefined;
+        for (&v) |*e| e.* = 1.0;
+        try storage.insertEmbedding(db, allocator, rid, &v);
+    }
+    // 1 FAR target row in the project we filter to (ranked last by distance).
+    const tid = try storage.insertMessage(db, .{
+        .file_path = "target.jsonl", .line_number = 1, .role = "assistant",
+        .content = "far target", .timestamp = null, .session_id = null,
+        .project_name = "target", .project_dir = "-x-target",
+    });
+    var tv: [1024]f32 = undefined;
+    for (&tv) |*e| e.* = 0.0;
+    try storage.insertEmbedding(db, allocator, tid, &tv);
+
+    const MockEmb = struct {
+        buf: [1024]f32,
+        fn embed(ctx: *anyopaque, alloc: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const out = try alloc.alloc([]f32, inputs.len);
+            for (out) |*o| o.* = try alloc.dupe(f32, &self.buf);
+            return out;
+        }
+        fn free(ctx: *anyopaque, alloc: std.mem.Allocator, embs: [][]f32) void {
+            _ = ctx;
+            for (embs) |e| alloc.free(e);
+            alloc.free(embs);
+        }
+    };
+    var qv: [1024]f32 = undefined;
+    for (&qv) |*e| e.* = 1.0;
+    var mock = MockEmb{ .buf = qv };
+    const embedder = embedding.Embedder{ .ctx = @ptrCast(&mock), .embed = MockEmb.embed, .free = MockEmb.free };
+
+    // top_n=1 -> old KNN limit=5 fills with near noise; target (rank ~20) is cut.
+    const sr = try search(allocator, db, embedder, "anything", .{
+        .mode = .vector, .top_n = 1, .project_filter = "target",
+    });
+    defer freeResults(allocator, sr.results);
+    try std.testing.expectEqual(@as(usize, 1), sr.results.len);
+    try std.testing.expectEqualStrings("target", sr.results[0].message.project_name.?);
 }
