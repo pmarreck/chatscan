@@ -38,6 +38,8 @@ chatscan "config" --json
 - **Sandwich display** — matched message shown bold, with previous/next messages dimmed for context
 - **Auto-scoping (with escape hatches)** — searches are scoped to the current directory's project by default, and say so on stderr; use `--all` to search everything or `--project <name-or-partial-path>` to target another project
 - **Env-var overrides** — `CHATSCAN_DB` and `CHATSCAN_CONVERSATION_DIR` (plus `CHATSCAN_LLM`) override paths without flags; CLI flags override env vars override config
+- **LLM source tag** — every hit is labelled with its origin CLI (`[claude]`/`[codex]`/`[gemini]`), derived from the conversation path; also in `--json` as `source`
+- **Noise exclusion** — indexing skips tool/meta conversation dirs (default: claude-mem observer sessions); extend with `CHATSCAN_IGNORE=<colon:separated:path:fragments>`
 - **Incremental indexing** — only re-indexes changed files based on mtime
 - **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
@@ -137,6 +139,7 @@ Index options:
   --reindex                     Force full re-index
 
 Global options:
+  CHATSCAN_IGNORE=<a:b:c>       Path fragments to exclude from indexing
   --db <path>                   SQLite database path (env: CHATSCAN_DB)
   --conversation-dir <path>     Conversation files directory (env: CHATSCAN_CONVERSATION_DIR)
   --ollama-url <url>            Ollama server URL (backend=ollama)

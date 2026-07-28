@@ -99,7 +99,21 @@ pub fn indexAllForLlm(
         }
     }
 
+    // Ignore-pattern set: built-in defaults + colon-separated CHATSCAN_IGNORE
+    // fragments. Matching files are skipped (never added to `on_disk`), so any
+    // previously-indexed copy is purged by the deleted-files sweep below.
+    const ignore_env = runtime.getEnvVarOwned(allocator, "CHATSCAN_IGNORE") catch null;
+    defer if (ignore_env) |e| allocator.free(e);
+    var ignore_patterns = std.ArrayListUnmanaged([]const u8).empty;
+    defer ignore_patterns.deinit(allocator);
+    for (config.default_ignore_patterns) |pat| try ignore_patterns.append(allocator, pat);
+    if (ignore_env) |e| {
+        var it = std.mem.tokenizeScalar(u8, e, ':');
+        while (it.next()) |tok| try ignore_patterns.append(allocator, tok);
+    }
+
     for (files) |file_path| {
+        if (config.isIgnoredPath(file_path, ignore_patterns.items)) continue;
         try on_disk.put(file_path, {});
 
         // Get file mtime
@@ -624,4 +638,104 @@ test "indexAll indexes files across batch boundary and skips unchanged on reinde
     try std.testing.expectEqual(@as(usize, 1), stats2.files_scanned);
     try std.testing.expectEqual(@as(usize, 0), stats2.files_indexed);
     try std.testing.expectEqual(@as(usize, 0), stats2.messages_indexed);
+}
+
+test "indexAll skips claude-mem observer sessions by default" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const conv_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-idx-ignore", .{tmpdir});
+    defer allocator.free(conv_dir);
+    const good_dir = try std.fmt.allocPrint(allocator, "{s}/-home-x-Code-realproj", .{conv_dir});
+    defer allocator.free(good_dir);
+    const obs_dir = try std.fmt.allocPrint(allocator, "{s}/-home-x--claude-mem-observer-sessions", .{conv_dir});
+    defer allocator.free(obs_dir);
+    const good_file = try std.fmt.allocPrint(allocator, "{s}/s.jsonl", .{good_dir});
+    defer allocator.free(good_file);
+    const obs_file = try std.fmt.allocPrint(allocator, "{s}/s.jsonl", .{obs_dir});
+    defer allocator.free(obs_file);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), good_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), obs_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    const line =
+        \\{"type":"user","timestamp":"2026-03-06T12:00:00Z","sessionId":"s1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"widget content here"}]}}
+    ;
+    {
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), good_file, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(), line);
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), obs_file, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(), line);
+    }
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var result = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer result.deinit(allocator);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
+    const stats = try indexAll(allocator, db, conv_dir, null, 16, false, &w.interface);
+
+    // Two files on disk, but the observer dir is skipped -> only one indexed.
+    try std.testing.expectEqual(@as(usize, 2), stats.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), stats.files_indexed);
+}
+
+test "indexAll purges a previously-indexed observer file (existing index cleanup)" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const conv_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-idx-purge", .{tmpdir});
+    defer allocator.free(conv_dir);
+    const obs_dir = try std.fmt.allocPrint(allocator, "{s}/-home-x--claude-mem-observer-sessions", .{conv_dir});
+    defer allocator.free(obs_dir);
+    const obs_file = try std.fmt.allocPrint(allocator, "{s}/s.jsonl", .{obs_dir});
+    defer allocator.free(obs_file);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), obs_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), conv_dir) catch {};
+    { // observer file still on disk (so it's scanned, then skipped by the ignore)
+        const f = try std.Io.Dir.cwd().createFile(runtime.io(), obs_file, .{});
+        defer f.close(runtime.io());
+        try f.writeStreamingAll(runtime.io(),
+            \\{"type":"user","timestamp":"2026-03-06T12:00:00Z","sessionId":"o1","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"obs xml here"}]}}
+        );
+    }
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var result = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer result.deinit(allocator);
+
+    // Simulate a pre-ignore index entry for the observer file.
+    _ = try storage.insertMessage(db, .{
+        .file_path = obs_file, .line_number = 1, .role = "user",
+        .content = "obs xml here", .timestamp = null, .session_id = "o1",
+        .project_name = "obs", .project_dir = "-home-x--claude-mem-observer-sessions",
+    });
+    try storage.upsertIndexedFile(db, obs_file, 111, 1);
+    {
+        var pre = try storage.getIndexedFile(db, allocator, obs_file);
+        try std.testing.expect(pre != null);
+        if (pre) |*m| m.deinit(allocator);
+    }
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
+    const stats = try indexAll(allocator, db, conv_dir, null, 16, false, &w.interface);
+
+    // The observer file is on disk but ignored -> its stale index rows are purged.
+    try std.testing.expect(stats.files_deleted >= 1);
+    var maybe = try storage.getIndexedFile(db, allocator, obs_file);
+    if (maybe) |*m| m.deinit(allocator);
+    try std.testing.expect(maybe == null);
 }

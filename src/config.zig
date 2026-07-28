@@ -50,6 +50,21 @@ pub const LlmSource = enum {
     }
 };
 
+/// Conversation-path fragments that indexing skips by default. The claude-mem
+/// "observer" sessions are a secondary agent's XML commentary on real sessions,
+/// not conversations worth searching. Extend at runtime via CHATSCAN_IGNORE.
+pub const default_ignore_patterns = [_][]const u8{"-claude-mem-observer-sessions"};
+
+/// True if `file_path` contains any of `patterns` as a literal substring — the
+/// classifier used to exclude tool/meta conversation dirs from the index.
+pub fn isIgnoredPath(file_path: []const u8, patterns: []const []const u8) bool {
+    for (patterns) |pat| {
+        if (pat.len == 0) continue;
+        if (std.mem.indexOf(u8, file_path, pat) != null) return true;
+    }
+    return false;
+}
+
 pub const Config = struct {
     conversation_dir: ?[]const u8 = null,
     db_path: ?[]const u8 = null,
@@ -291,4 +306,19 @@ test "LlmSource.fromPath classifies origin CLI over a set of paths" {
     // Labels round-trip through parse.
     try std.testing.expectEqualStrings("codex", LlmSource.codex.label());
     try std.testing.expectEqual(LlmSource.gemini, try LlmSource.parse(LlmSource.gemini.label()));
+}
+
+test "isIgnoredPath excludes observer sessions, keeps real projects (classifier over a set)" {
+    const def = &default_ignore_patterns;
+    try std.testing.expect(isIgnoredPath("/home/p/.claude/projects/-home-p--claude-mem-observer-sessions/a.jsonl", def));
+    try std.testing.expect(!isIgnoredPath("/home/p/.claude/projects/-home-p-Code-dirtree/a.jsonl", def));
+    try std.testing.expect(!isIgnoredPath("/home/p/.claude/projects/-home-p-Code-validate/b.jsonl", def));
+    // Custom CHATSCAN_IGNORE-style patterns compose as a set.
+    const custom = [_][]const u8{ "scratch", "fixture-gamma" };
+    try std.testing.expect(isIgnoredPath("/x/scratch/y.jsonl", &custom));
+    try std.testing.expect(isIgnoredPath("/x/-a-fixture-gamma/y.jsonl", &custom));
+    try std.testing.expect(!isIgnoredPath("/x/-a-fixture-beta/y.jsonl", &custom));
+    // Empty set / empty pattern ignore nothing.
+    try std.testing.expect(!isIgnoredPath("/anything", &[_][]const u8{}));
+    try std.testing.expect(!isIgnoredPath("/anything", &[_][]const u8{""}));
 }

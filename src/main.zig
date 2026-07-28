@@ -742,6 +742,9 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\
         \\Index options:
         \\  --reindex                     Force full re-index
+        \\  CHATSCAN_IGNORE=<a:b:c>       Colon-separated path fragments to exclude from
+        \\                                indexing (adds to the built-in default that
+        \\                                skips claude-mem observer sessions)
         \\
         \\Global options:
         \\  --db <path>                   SQLite database path
