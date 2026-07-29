@@ -1243,3 +1243,67 @@ test "lexical mode ranks a stronger match above a weaker one" {
     try std.testing.expectEqual(@as(usize, 2), sr.results.len);
     try std.testing.expectEqualStrings("s-strong", sr.results[0].message.session_id.?);
 }
+
+test "hybrid weights change the ranking: vector-heavy vs lexical-heavy flip the winner" {
+    // Doc A: strong VECTOR match (embedding == query) but no query terms.
+    // Doc B: strong LEXICAL match (has the terms) but embedding far from query.
+    // Cranking weight_vector should rank A first; weight_lexical should rank B.
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+
+    const a = try storage.insertMessage(db, .{
+        .file_path = "a.jsonl", .line_number = 1, .role = "assistant",
+        .content = "an unrelated note about zebras and savannas", .timestamp = null,
+        .session_id = "sa", .project_name = "pa", .project_dir = "-x-pa",
+    });
+    var av: [1024]f32 = undefined;
+    for (&av) |*e| e.* = 1.0; // == query vector -> distance 0
+    try storage.insertEmbedding(db, allocator, a, &av);
+
+    const b = try storage.insertMessage(db, .{
+        .file_path = "b.jsonl", .line_number = 1, .role = "assistant",
+        .content = "the ghostty window is described right here", .timestamp = null,
+        .session_id = "sb", .project_name = "pb", .project_dir = "-x-pb",
+    });
+    var bv: [1024]f32 = undefined;
+    for (&bv) |*e| e.* = 0.0; // far from query vector
+    try storage.insertEmbedding(db, allocator, b, &bv);
+
+    const MockEmb = struct {
+        buf: [1024]f32,
+        fn embed(ctx: *anyopaque, alloc: std.mem.Allocator, inputs: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const out = try alloc.alloc([]f32, inputs.len);
+            for (out) |*o| o.* = try alloc.dupe(f32, &self.buf);
+            return out;
+        }
+        fn free(ctx: *anyopaque, alloc: std.mem.Allocator, embs: [][]f32) void {
+            _ = ctx;
+            for (embs) |e| alloc.free(e);
+            alloc.free(embs);
+        }
+    };
+    var qv: [1024]f32 = undefined;
+    for (&qv) |*e| e.* = 1.0;
+    var mock = MockEmb{ .buf = qv };
+    const embedder = embedding.Embedder{ .ctx = @ptrCast(&mock), .embed = MockEmb.embed, .free = MockEmb.free };
+
+    // Vector-heavy: the semantic match (A, "zebras") wins.
+    const vecheavy = try search(allocator, db, embedder, "ghostty window", .{
+        .mode = .hybrid, .top_n = 5, .weight_vector = 10.0, .weight_lexical = 0.01, .weight_recency = 0.0,
+    });
+    defer freeResults(allocator, vecheavy.results);
+    try std.testing.expect(vecheavy.results.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, vecheavy.results[0].message.content, "zebras") != null);
+
+    // Lexical-heavy: the keyword match (B, "ghostty window") wins.
+    const lexheavy = try search(allocator, db, embedder, "ghostty window", .{
+        .mode = .hybrid, .top_n = 5, .weight_vector = 0.01, .weight_lexical = 10.0, .weight_recency = 0.0,
+    });
+    defer freeResults(allocator, lexheavy.results);
+    try std.testing.expect(lexheavy.results.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, lexheavy.results[0].message.content, "ghostty") != null);
+}

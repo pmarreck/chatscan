@@ -1,5 +1,7 @@
 # Plan
 
+- [x] Make RRF ranking weights configurable (config keys weight_vector/weight_lexical/weight_recency + --weight-* CLI flags + CHATSCAN_WEIGHT_* env; flag>env>config>default; defaults unchanged 1.0/1.0/0.3) so a weak embedding model can be dialed down instead of dominating. Done 2026-07-28 22:30 EDT. TDD: config parse, cli parse (incl. reject non-numeric), and a search.zig behavioral test proving vector-heavy vs lexical-heavy flips the winner.
+- [ ] Embedding-index backups (housekeeping, removable later): `~/.local/share/chatscan/index.sqlite3.jina-1536.bak` (the jina-code-embeddings-1.5b experiment, 177MB) — kept for now for A/B, safe to delete once bge is confirmed the keeper. bge-m3 (1024-dim) is the ACTIVE index again after jina ranked poorly for conversational recall.
 - [x] Exclude observer/meta noise: configurable ignore-list (default-skips claude-mem observer-sessions; extend via CHATSCAN_IGNORE). Index-time skip + auto-purge of previously-indexed rows via the delete-sweep. Verified on a real-index COPY: observer purged, real convs intact, real index untouched. Done 2026-07-28 13:46 EDT. Files stay on disk (still mineable).
 - [x] Show LLM source (claude/codex/gemini) on each hit via LlmSource.fromPath — [source] tag in human output + JSON source field. Done 2026-07-28 13:32 EDT.
 - [ ] (future / separate) Evaluate mining the 151 claude-mem observer-sessions (Jun28-Jul6, ~1.5M tokens of typed <observation> records) as source material for the memories skill. Needs curation.

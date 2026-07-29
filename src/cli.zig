@@ -73,6 +73,9 @@ pub const Parsed = struct {
     reindex: bool = false,
     force: bool = false,
     llm_source: ?config.LlmSource = null,
+    weight_vector: ?f32 = null,
+    weight_lexical: ?f32 = null,
+    weight_recency: ?f32 = null,
 
     // Rename args
     rename_old: ?[]const u8 = null,
@@ -206,6 +209,27 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 parsed.llm_source = config.LlmSource.parse(args[i]) catch return error.InvalidLlmSource;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--weight-vector")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.weight_vector = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidWeight;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--weight-lexical")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.weight_lexical = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidWeight;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--weight-recency")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.weight_recency = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidWeight;
                 i += 1;
                 continue;
             }
@@ -472,4 +496,20 @@ test "parse no args" {
     defer parsed.deinit(allocator);
     try std.testing.expectEqual(CommandTag.search, parsed.command);
     try std.testing.expect(parsed.query == null);
+}
+
+test "parse reads --weight-* flags as floats (later overrides earlier)" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "query", "--weight-vector", "0.2", "--weight-lexical", "1.5", "--weight-recency", "0.1", "--weight-vector", "0.4" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), parsed.weight_vector.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), parsed.weight_lexical.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.weight_recency.?, 0.0001);
+}
+
+test "parse rejects a non-numeric weight" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "query", "--weight-vector", "notanumber" };
+    try std.testing.expectError(error.InvalidWeight, parse(allocator, &args));
 }

@@ -24,6 +24,9 @@ const Defaults = struct {
     batch_size: usize = 16,
     search_mode: search_mod.SearchMode = .hybrid,
     context_lines: usize = 4,
+    weight_vector: f32 = 1.0,
+    weight_lexical: f32 = 1.0,
+    weight_recency: f32 = 0.3,
 };
 
 const Settings = struct {
@@ -51,6 +54,9 @@ const Settings = struct {
     reindex: bool,
     force: bool,
     llm_source: config.LlmSource,
+    weight_vector: f32,
+    weight_lexical: f32,
+    weight_recency: f32,
     /// Extra conversation dirs for --all-llms mode
     extra_dirs: []ExtraDir = &.{},
 
@@ -82,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
             error.InvalidDate => _ = stderr.print("error: invalid date — expected YYYY-MM-DD (e.g. --since 2026-07-01)\n", .{}) catch {},
             error.MissingValue => _ = stderr.print("error: an option is missing its value\n", .{}) catch {},
             error.InvalidRole => _ = stderr.print("error: --role must be 'user' or 'assistant'\n", .{}) catch {},
+            error.InvalidWeight => _ = stderr.print("error: --weight-* must be a number (e.g. --weight-vector 0.4)\n", .{}) catch {},
             else => _ = stderr.print("error: {s}\n", .{@errorName(err)}) catch {},
         }
         _ = stderr.flush() catch {};
@@ -286,6 +293,9 @@ pub fn main(init: std.process.Init) !void {
                 .project_dir_filter = project_dir_filter,
                 .since = parsed.since,
                 .until = parsed.until,
+                .weight_vector = settings.weight_vector,
+                .weight_lexical = settings.weight_lexical,
+                .weight_recency = settings.weight_recency,
             }) catch |err| {
                 _ = stderr.print("error: search failed: {s}\n", .{@errorName(err)}) catch {};
                 switch (err) {
@@ -320,6 +330,16 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         },
     }
+}
+
+/// Resolve one RRF weight: CLI flag > env var > config > default.
+fn resolveWeight(allocator: std.mem.Allocator, flag: ?f32, env_name: []const u8, cfg_val: ?f32, default: f32) f32 {
+    if (flag) |w| return w;
+    if (runtime.getEnvVarOwned(allocator, env_name)) |env_val| {
+        defer allocator.free(env_val);
+        if (std.fmt.parseFloat(f32, env_val)) |v| return v else |_| {}
+    } else |_| {}
+    return cfg_val orelse default;
 }
 
 fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config.Config) !Settings {
@@ -424,6 +444,10 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         if (cfg.embedding_api_key) |k| api_key = k;
     }
 
+    const weight_vector = resolveWeight(allocator, parsed.weight_vector, "CHATSCAN_WEIGHT_VECTOR", cfg.weight_vector, defaults.weight_vector);
+    const weight_lexical = resolveWeight(allocator, parsed.weight_lexical, "CHATSCAN_WEIGHT_LEXICAL", cfg.weight_lexical, defaults.weight_lexical);
+    const weight_recency = resolveWeight(allocator, parsed.weight_recency, "CHATSCAN_WEIGHT_RECENCY", cfg.weight_recency, defaults.weight_recency);
+
     return Settings{
         .output = parsed.output,
         .top_n = if (parsed.seen.top_n) parsed.top_n else defaults.top_n,
@@ -449,6 +473,9 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         .reindex = parsed.reindex,
         .force = parsed.force,
         .llm_source = llm_source,
+        .weight_vector = weight_vector,
+        .weight_lexical = weight_lexical,
+        .weight_recency = weight_recency,
         .extra_dirs = try extra_dirs.toOwnedSlice(allocator),
     };
 }
@@ -734,6 +761,13 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --mode <vector|lexical|hybrid> Search mode (default hybrid)
         \\  --context-lines <n>           Lines to show per message (default 4)
         \\  --json                        JSON output
+        \\
+        \\Ranking options (hybrid mode):
+        \\  --weight-vector <f>           Semantic/embedding weight (default 1.0)
+        \\  --weight-lexical <f>          Keyword/FTS weight (default 1.0)
+        \\  --weight-recency <f>          Recency tiebreaker weight (default 0.3)
+        \\                                config keys: weight_vector/weight_lexical/weight_recency
+        \\                                (flag > CHATSCAN_WEIGHT_* env > config > default)
         \\
         \\LLM source options:
         \\  --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)

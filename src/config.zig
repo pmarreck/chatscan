@@ -74,6 +74,9 @@ pub const Config = struct {
     embedding_backend: ?EmbeddingBackend = null,
     embedding_url: ?[]const u8 = null,
     embedding_model: ?[]const u8 = null,
+    weight_vector: ?f32 = null,
+    weight_lexical: ?f32 = null,
+    weight_recency: ?f32 = null,
     embedding_api_key: ?[]const u8 = null,
     // Raw pre-expansion value for embedding_api_key, used to preserve ${VAR}
     // placeholders when rewriting the config file.
@@ -200,6 +203,12 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8) !Config {
                 cfg.embedding_api_key = try storeExpanded(allocator, &cfg, value);
             } else if (std.mem.eql(u8, key, "embedding_dim")) {
                 cfg.embedding_dim = std.fmt.parseInt(usize, value, 10) catch null;
+            } else if (std.mem.eql(u8, key, "weight_vector")) {
+                cfg.weight_vector = std.fmt.parseFloat(f32, value) catch null;
+            } else if (std.mem.eql(u8, key, "weight_lexical")) {
+                cfg.weight_lexical = std.fmt.parseFloat(f32, value) catch null;
+            } else if (std.mem.eql(u8, key, "weight_recency")) {
+                cfg.weight_recency = std.fmt.parseFloat(f32, value) catch null;
             }
         }
     }
@@ -321,4 +330,18 @@ test "isIgnoredPath excludes observer sessions, keeps real projects (classifier 
     // Empty set / empty pattern ignore nothing.
     try std.testing.expect(!isIgnoredPath("/anything", &[_][]const u8{}));
     try std.testing.expect(!isIgnoredPath("/anything", &[_][]const u8{""}));
+}
+
+test "parseConfig parses RRF ranking weights" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\weight_vector = 0.4
+        \\weight_lexical = 1.0
+        \\weight_recency = 0.25
+    ;
+    var cfg = try parseConfig(allocator, text);
+    defer cfg.deinit(allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.weight_vector.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.weight_lexical.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), cfg.weight_recency.?, 0.0001);
 }
