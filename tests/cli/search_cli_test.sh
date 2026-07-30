@@ -159,6 +159,21 @@ assert_eq "claude" "$src_json" "json output tags each hit with source=claude (fi
 src_human="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --all --mode lexical 2>/dev/null)"
 assert_contains "$src_human" "[claude]" "human output shows the [claude] source tag"
 
+# --- watch: self-suiciding daemon retires on idle --------------------------
+TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || echo "")"
+if [ -n "$TIMEOUT_BIN" ]; then
+	watch_db="$WORK/watch.sqlite3"
+	watch_t0="$(date +%s)"
+	watch_out="$(CHATSCAN_DB="$watch_db" CHATSCAN_CONVERSATION_DIR="$FIX" "$TIMEOUT_BIN" 20 "$BIN" watch --idle-timeout 2s --interval 1 --embedding-url http://127.0.0.1:1 2>&1)"
+	watch_rc=$?
+	watch_t1="$(date +%s)"
+	assert_eq 0 "$watch_rc" "watch self-terminates on idle (exit 0, not timeout-killed)"
+	assert_contains "$watch_out" "retiring after 2 seconds" "watch announces its idle retirement"
+	if [ "$((watch_t1 - watch_t0))" -le 12 ]; then pass "watch retires promptly"; else fail "watch retires promptly" "took $((watch_t1-watch_t0))s"; fi
+else
+	pass "watch self-terminate test skipped (no timeout/gtimeout available)"
+fi
+
 # --- Summary -----------------------------------------------------------------
 echo
 if [ "$FAILS" -eq 0 ]; then

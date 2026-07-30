@@ -11,6 +11,28 @@ const ripgrep = @import("ripgrep.zig");
 const conversation = @import("conversation.zig");
 const rename_mod = @import("rename.zig");
 const runtime = @import("runtime.zig");
+const builtin = @import("builtin");
+const watch = @import("watch.zig");
+const retirement = @import("retirement.zig");
+
+/// Set by SIGINT/SIGTERM so the watch loop can finish its current pass and exit.
+var g_watch_stop = std.atomic.Value(bool).init(false);
+
+/// Installs graceful-stop handlers for the watcher (no-op on Windows).
+fn installWatchSignalHandlers() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = struct {
+            fn handler(_: std.c.SIG) callconv(.c) void {
+                g_watch_stop.store(true, .release);
+            }
+        }.handler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
 
 const version = "0.1.0";
 
@@ -27,6 +49,8 @@ const Defaults = struct {
     weight_vector: f32 = 1.0,
     weight_lexical: f32 = 1.0,
     weight_recency: f32 = 0.3,
+    watch_interval_s: u64 = 2,
+    watch_idle_timeout: []const u8 = "30m",
 };
 
 const Settings = struct {
@@ -57,6 +81,8 @@ const Settings = struct {
     weight_vector: f32,
     weight_lexical: f32,
     weight_recency: f32,
+    watch_interval_s: u64,
+    watch_idle_timeout: []const u8,
     /// Extra conversation dirs for --all-llms mode
     extra_dirs: []ExtraDir = &.{},
 
@@ -216,6 +242,44 @@ pub fn main(init: std.process.Init) !void {
                 try stdout.print("Removed {d} deleted files from index\n", .{total_deleted});
             }
             try stdout.flush();
+        },
+        .watch => {
+            try ensureDbDir(allocator, settings.db_path);
+            const db = try storage.openFileWithVec(allocator, settings.db_path);
+            defer storage.close(db);
+            var schema_result = try storage.initSchema(allocator, db, .{
+                .embedding_dim = settings.embedding_dim,
+                .embedding_model = settings.ollama_model,
+            });
+            defer schema_result.deinit(allocator);
+
+            // An unparseable idle limit stops rather than silently becoming
+            // "never" or "immediately" — a typo would otherwise go unnoticed.
+            const idle_limit_ns = retirement.parseIdleLimit(settings.watch_idle_timeout) catch {
+                _ = stderr.print("error: invalid --idle-timeout '{s}' (use e.g. 30m, 2h, 1d, 90s, or never)\n", .{settings.watch_idle_timeout}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(64);
+            };
+
+            var http_client = ollama.StdHttpTransport.init(allocator);
+            defer http_client.deinit();
+            var ollama_adapter: embedding.OllamaEmbedder = undefined;
+            var openai_adapter: embedding.OpenAIEmbedder = undefined;
+            const emb = setupEmbedder(allocator, &http_client, settings, stderr, &ollama_adapter, &openai_adapter);
+
+            installWatchSignalHandlers();
+
+            const primary_llm: config.LlmSource = if (settings.llm_source == .all) .claude else settings.llm_source;
+            watch.watchLoop(allocator, db, settings.conversation_dir, emb, .{
+                .interval_ms = settings.watch_interval_s * std.time.ms_per_s,
+                .llm = primary_llm,
+                .batch_size = settings.batch_size,
+                .idle_limit_ns = idle_limit_ns,
+            }, &g_watch_stop, stderr) catch |err| {
+                _ = stderr.print("watcher: exited with error: {s}\n", .{@errorName(err)}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(1);
+            };
         },
         .search => {
             const query = parsed.query orelse {
@@ -447,6 +511,8 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
     const weight_vector = resolveWeight(allocator, parsed.weight_vector, "CHATSCAN_WEIGHT_VECTOR", cfg.weight_vector, defaults.weight_vector);
     const weight_lexical = resolveWeight(allocator, parsed.weight_lexical, "CHATSCAN_WEIGHT_LEXICAL", cfg.weight_lexical, defaults.weight_lexical);
     const weight_recency = resolveWeight(allocator, parsed.weight_recency, "CHATSCAN_WEIGHT_RECENCY", cfg.weight_recency, defaults.weight_recency);
+    const watch_interval_s: u64 = parsed.watch_interval_s orelse cfg.watcher_interval orelse defaults.watch_interval_s;
+    const watch_idle_timeout: []const u8 = parsed.watch_idle_timeout orelse cfg.watcher_idle_timeout orelse defaults.watch_idle_timeout;
 
     return Settings{
         .output = parsed.output,
@@ -476,6 +542,8 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
         .weight_vector = weight_vector,
         .weight_lexical = weight_lexical,
         .weight_recency = weight_recency,
+        .watch_interval_s = watch_interval_s,
+        .watch_idle_timeout = watch_idle_timeout,
         .extra_dirs = try extra_dirs.toOwnedSlice(allocator),
     };
 }
@@ -779,6 +847,11 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  CHATSCAN_IGNORE=<a:b:c>       Colon-separated path fragments to exclude from
         \\                                indexing (adds to the built-in default that
         \\                                skips claude-mem observer sessions)
+        \\
+        \\Watch options (chatscan watch — auto-reindex daemon, self-terminates when idle):
+        \\  --interval <seconds>          Poll interval (default 2; config: watcher_interval)
+        \\  --idle-timeout <dur>          Stand down after this idle (default 30m; accepts
+        \\                                30m/2h/1d/90s or never; config: watcher_idle_timeout)
         \\
         \\Global options:
         \\  --db <path>                   SQLite database path

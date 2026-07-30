@@ -77,6 +77,8 @@ pub const Config = struct {
     weight_vector: ?f32 = null,
     weight_lexical: ?f32 = null,
     weight_recency: ?f32 = null,
+    watcher_interval: ?u64 = null,
+    watcher_idle_timeout: ?[]const u8 = null,
     embedding_api_key: ?[]const u8 = null,
     // Raw pre-expansion value for embedding_api_key, used to preserve ${VAR}
     // placeholders when rewriting the config file.
@@ -209,6 +211,10 @@ fn parseConfig(allocator: std.mem.Allocator, content: []const u8) !Config {
                 cfg.weight_lexical = std.fmt.parseFloat(f32, value) catch null;
             } else if (std.mem.eql(u8, key, "weight_recency")) {
                 cfg.weight_recency = std.fmt.parseFloat(f32, value) catch null;
+            } else if (std.mem.eql(u8, key, "watcher_interval")) {
+                cfg.watcher_interval = std.fmt.parseInt(u64, value, 10) catch null;
+            } else if (std.mem.eql(u8, key, "watcher_idle_timeout")) {
+                cfg.watcher_idle_timeout = try storeExpanded(allocator, &cfg, value);
             }
         }
     }
@@ -344,4 +350,16 @@ test "parseConfig parses RRF ranking weights" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.weight_vector.?, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.weight_lexical.?, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), cfg.weight_recency.?, 0.0001);
+}
+
+test "parseConfig parses watcher_interval and watcher_idle_timeout" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\watcher_interval = 5
+        \\watcher_idle_timeout = 30m
+    ;
+    var cfg = try parseConfig(allocator, text);
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 5), cfg.watcher_interval.?);
+    try std.testing.expectEqualStrings("30m", cfg.watcher_idle_timeout.?);
 }

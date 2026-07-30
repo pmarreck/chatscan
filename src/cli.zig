@@ -14,6 +14,7 @@ pub const CommandTag = enum {
     search,
     config,
     rename,
+    watch,
 };
 
 pub const ConfigAction = enum {
@@ -76,6 +77,8 @@ pub const Parsed = struct {
     weight_vector: ?f32 = null,
     weight_lexical: ?f32 = null,
     weight_recency: ?f32 = null,
+    watch_interval_s: ?u64 = null,
+    watch_idle_timeout: ?[]const u8 = null,
 
     // Rename args
     rename_old: ?[]const u8 = null,
@@ -238,6 +241,20 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--interval")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.watch_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidInterval;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--idle-timeout")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.watch_idle_timeout = args[i];
+                i += 1;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--context-lines")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
@@ -342,6 +359,12 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
             }
             if (std.mem.eql(u8, arg, "index")) {
                 parsed.command = .index;
+                verb_seen = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "watch")) {
+                parsed.command = .watch;
                 verb_seen = true;
                 i += 1;
                 continue;
@@ -512,4 +535,14 @@ test "parse rejects a non-numeric weight" {
     const allocator = std.testing.allocator;
     const args = [_][]const u8{ "query", "--weight-vector", "notanumber" };
     try std.testing.expectError(error.InvalidWeight, parse(allocator, &args));
+}
+
+test "parse recognizes the watch command and its flags" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "chatscan", "watch", "--interval", "5", "--idle-timeout", "30m" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(CommandTag.watch, parsed.command);
+    try std.testing.expectEqual(@as(u64, 5), parsed.watch_interval_s.?);
+    try std.testing.expectEqualStrings("30m", parsed.watch_idle_timeout.?);
 }
