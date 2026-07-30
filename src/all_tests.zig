@@ -4,6 +4,7 @@ comptime {
     _ = @import("storage.zig");
     _ = @import("conversation.zig");
     _ = @import("indexer.zig");
+    _ = @import("retirement.zig");
     _ = @import("search.zig");
     _ = @import("ripgrep.zig");
     _ = @import("output.zig");
