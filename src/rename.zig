@@ -322,9 +322,12 @@ pub fn confirmPrompt(writer: *std.Io.Writer) !bool {
     const stdin = std.Io.File.stdin();
     var buf: [16]u8 = undefined;
     var stdin_reader = stdin.reader(runtime.io(), &buf);
-    const n = stdin_reader.interface.readSliceShort(&buf) catch return false;
-    if (n == 0) return false;
-    const input = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    return readConfirmation(&stdin_reader.interface);
+}
+
+fn readConfirmation(reader: *std.Io.Reader) bool {
+    const line = (reader.takeDelimiter('\n') catch return false) orelse return false;
+    const input = std.mem.trim(u8, line, " \t\r");
     return input.len == 1 and (input[0] == 'y' or input[0] == 'Y');
 }
 
@@ -578,6 +581,48 @@ test "pathToSlug" {
         const slug = try pathToSlug(allocator, case.path);
         defer allocator.free(slug);
         try std.testing.expectEqualStrings(case.slug, slug);
+    }
+}
+
+const NewlineThenReadFailure = struct {
+    interface: std.Io.Reader,
+    line: []const u8,
+    delivered_line: bool = false,
+
+    fn init(buffer: []u8, line: []const u8) NewlineThenReadFailure {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .line = line,
+        };
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = limit;
+        const self: *NewlineThenReadFailure = @alignCast(@fieldParentPtr("interface", reader));
+        if (self.delivered_line) return error.ReadFailed;
+        self.delivered_line = true;
+        return writer.write(self.line);
+    }
+};
+
+test "confirmation classifies completed lines without waiting for stream closure" {
+    const cases = [_]struct { line: []const u8, expected: bool }{
+        .{ .line = "y\n", .expected = true },
+        .{ .line = "Y\r\n", .expected = true },
+        .{ .line = "n\n", .expected = false },
+        .{ .line = "yes\n", .expected = false },
+        .{ .line = "\n", .expected = false },
+        .{ .line = "  \n", .expected = false },
+    };
+    for (cases) |case| {
+        var reader_buffer: [16]u8 = undefined;
+        var source = NewlineThenReadFailure.init(&reader_buffer, case.line);
+        try std.testing.expectEqual(case.expected, readConfirmation(&source.interface));
     }
 }
 

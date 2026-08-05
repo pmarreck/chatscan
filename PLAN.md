@@ -1,5 +1,8 @@
 # Plan
 
+- [x] Diagnose the live `chatscan rename` stall without interrupting it or risking the partially renamed project, reproduce the blocking phase, and repair it TDD-first — completed 2026-08-05 12:23 EDT.
+  - [x] Record the cross-project Zig 0.16 prompt-reader lesson in shared `~/MEMORIES`; the full memory root validates — completed 2026-08-05 12:17 EDT.
+  - Curiosity poke: did the command block before mutation on confirmation input, during an atomic directory move, while rewriting a log, or inside SQLite locking/work proportional to the full index?
 - [x] Confirm which activity resets the watcher idle timeout: a successful pass that indexes or deletes files; searches and no-op polls do not reset it — completed 2026-08-05 10:56 EDT.
 - [x] Confirm and report the default `chatscan watch` idle timeout: `30m`; `never` disables retirement — completed 2026-08-05 10:54 EDT.
 - [x] Realign `chatscan rename` with current Claude and Codex storage formats, then verify the real rename plan without mutating Peter's project or logs — completed 2026-08-05 11:06 EDT.
