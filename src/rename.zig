@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const conversation = @import("conversation.zig");
 const storage = @import("storage.zig");
 const runtime = @import("runtime.zig");
 
@@ -95,12 +96,12 @@ fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return result;
 }
 
-/// Convert a path to the Claude project directory slug format.
+/// Convert a path to Claude's current project-directory slug format.
 /// e.g., /Users/pmarreck/Documents-CloudManaged/codescan -> -Users-pmarreck-Documents-CloudManaged-codescan
 fn pathToSlug(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var slug = try allocator.alloc(u8, path.len);
     for (path, 0..) |ch, i| {
-        slug[i] = if (ch == '/') '-' else ch;
+        slug[i] = if (std.ascii.isAlphanumeric(ch) or ch == '-') ch else '-';
     }
     return slug;
 }
@@ -363,65 +364,45 @@ fn findCodexFilesWithCwd(
     old_path: []const u8,
     result: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    // Walk YYYY/MM/DD/*.jsonl and grep for session_meta with matching cwd
-    var year_dir = std.Io.Dir.cwd().openDir(runtime.io(), sessions_dir, .{ .iterate = true }) catch return;
-    defer year_dir.close(runtime.io());
-
-    var year_iter = year_dir.iterate();
-    while (try year_iter.next(runtime.io())) |ye| {
-        if (ye.kind != .directory) continue;
-        var month_dir = year_dir.openDir(runtime.io(), ye.name, .{ .iterate = true }) catch continue;
-        defer month_dir.close(runtime.io());
-
-        var month_iter = month_dir.iterate();
-        while (try month_iter.next(runtime.io())) |me| {
-            if (me.kind != .directory) continue;
-            var day_dir = month_dir.openDir(runtime.io(), me.name, .{ .iterate = true }) catch continue;
-            defer day_dir.close(runtime.io());
-
-            var day_iter = day_dir.iterate();
-            while (try day_iter.next(runtime.io())) |de| {
-                if (de.kind != .directory) continue;
-                var file_dir = day_dir.openDir(runtime.io(), de.name, .{ .iterate = true }) catch continue;
-                defer file_dir.close(runtime.io());
-
-                var file_iter = file_dir.iterate();
-                while (try file_iter.next(runtime.io())) |fe| {
-                    if (fe.kind != .file) continue;
-                    if (!std.mem.endsWith(u8, fe.name, ".jsonl")) continue;
-
-                    const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}/{s}", .{
-                        sessions_dir, ye.name, me.name, de.name, fe.name,
-                    });
-
-                    // Check if this file contains a session_meta with matching cwd
-                    if (fileContainsCwd(allocator, full_path, old_path)) {
-                        try result.append(allocator, full_path);
-                    } else {
-                        allocator.free(full_path);
-                    }
-                }
-            }
+    const files = try conversation.findCodexFiles(allocator, sessions_dir);
+    defer {
+        for (files) |path| allocator.free(path);
+        allocator.free(files);
+    }
+    for (files) |path| {
+        if (fileContainsCwd(allocator, path, old_path)) {
+            try result.append(allocator, try allocator.dupe(u8, path));
         }
     }
 }
 
+/// Match only the authoritative session metadata cwd, never incidental path text.
+fn sessionMetaMatchesCwd(allocator: std.mem.Allocator, line: []const u8, target_cwd: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{
+        .allocate = .alloc_always,
+    }) catch return false;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return false;
+    const record_type = root.object.get("type") orelse return false;
+    if (record_type != .string or !std.mem.eql(u8, record_type.string, "session_meta")) return false;
+    const payload = root.object.get("payload") orelse return false;
+    if (payload != .object) return false;
+    const cwd = payload.object.get("cwd") orelse return false;
+    return cwd == .string and std.mem.eql(u8, cwd.string, target_cwd);
+}
+
 fn fileContainsCwd(allocator: std.mem.Allocator, file_path: []const u8, target_cwd: []const u8) bool {
-    // Read first few KB looking for session_meta with cwd
     const file = std.Io.Dir.cwd().openFile(runtime.io(), file_path, .{}) catch return false;
     defer file.close(runtime.io());
-    // session_meta is always the first line
     var buf: [8192]u8 = undefined;
     var freader = file.reader(runtime.io(), &buf);
     const n = freader.interface.readSliceShort(&buf) catch return false;
     if (n == 0) return false;
 
-    // Quick check: does the first line contain the target path?
     const first_line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
-    const first_line = buf[0..first_line_end];
-    _ = allocator;
-    return std.mem.indexOf(u8, first_line, target_cwd) != null and
-        std.mem.indexOf(u8, first_line, "session_meta") != null;
+    return sessionMetaMatchesCwd(allocator, buf[0..first_line_end], target_cwd);
 }
 
 fn findGeminiDirsWithPath(
@@ -579,9 +560,25 @@ fn updateIndex(
 
 test "pathToSlug" {
     const allocator = std.testing.allocator;
-    const slug = try pathToSlug(allocator, "/Users/pmarreck/Documents-CloudManaged/codescan");
-    defer allocator.free(slug);
-    try std.testing.expectEqualStrings("-Users-pmarreck-Documents-CloudManaged-codescan", slug);
+    const cases = [_]struct { path: []const u8, slug: []const u8 }{
+        .{
+            .path = "/Users/pmarreck/Documents-CloudManaged/codescan",
+            .slug = "-Users-pmarreck-Documents-CloudManaged-codescan",
+        },
+        .{
+            .path = "/home/pmarreck/Code/collation_mf_do_you_speak_it",
+            .slug = "-home-pmarreck-Code-collation-mf-do-you-speak-it",
+        },
+        .{
+            .path = "/home/pmarreck/Code/project.with spaces",
+            .slug = "-home-pmarreck-Code-project-with-spaces",
+        },
+    };
+    for (cases) |case| {
+        const slug = try pathToSlug(allocator, case.path);
+        defer allocator.free(slug);
+        try std.testing.expectEqualStrings(case.slug, slug);
+    }
 }
 
 test "resolvePath absolute" {
@@ -666,6 +663,51 @@ test "updateCodexFile replaces cwd" {
     defer allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "/Users/test/new-project") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/Users/test/old-project") == null);
+}
+
+test "Codex rename discovery classifies exact session cwd over a set" {
+    const allocator = std.testing.allocator;
+    const tmpdir = getTmpDir(allocator);
+    defer freeTmpDir(allocator, tmpdir);
+
+    const sessions_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-codex-rename-discovery", .{tmpdir});
+    defer allocator.free(sessions_dir);
+    const day_dir = try std.fmt.allocPrint(allocator, "{s}/2026/08/05", .{sessions_dir});
+    defer allocator.free(day_dir);
+    const direct_match = try std.fmt.allocPrint(allocator, "{s}/direct-match.jsonl", .{day_dir});
+    defer allocator.free(direct_match);
+    const direct_other = try std.fmt.allocPrint(allocator, "{s}/direct-other.jsonl", .{day_dir});
+    defer allocator.free(direct_other);
+    const sibling_cwd = try std.fmt.allocPrint(allocator, "{s}/sibling-cwd.jsonl", .{day_dir});
+    defer allocator.free(sibling_cwd);
+    const incidental_text = try std.fmt.allocPrint(allocator, "{s}/incidental-text.jsonl", .{day_dir});
+    defer allocator.free(incidental_text);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), sessions_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(runtime.io(), day_dir);
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), sessions_dir) catch {};
+
+    const fixtures = [_]struct { path: []const u8, line: []const u8 }{
+        .{ .path = direct_match, .line = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/test/old-project\"}}\n" },
+        .{ .path = direct_other, .line = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/test/other\"}}\n" },
+        .{ .path = sibling_cwd, .line = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/test/old-project-copy\"}}\n" },
+        .{ .path = incidental_text, .line = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/test/other\",\"note\":\"/home/test/old-project\"}}\n" },
+    };
+    for (fixtures) |fixture| {
+        const file = try std.Io.Dir.cwd().createFile(runtime.io(), fixture.path, .{});
+        defer file.close(runtime.io());
+        try file.writeStreamingAll(runtime.io(), fixture.line);
+    }
+
+    var matches = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (matches.items) |path| allocator.free(path);
+        matches.deinit(allocator);
+    }
+    try findCodexFilesWithCwd(allocator, sessions_dir, "/home/test/old-project", &matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+    try std.testing.expectEqualStrings(direct_match, matches.items[0]);
 }
 
 test "updateGeminiProjectRoot writes new path" {

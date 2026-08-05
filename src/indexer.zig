@@ -50,11 +50,10 @@ pub fn indexAllForLlm(
     if (files.len == 0) {
         _ = stderr.print("No conversation files found in {s}\n", .{conversation_dir}) catch {};
         _ = stderr.flush() catch {};
-        return stats;
+    } else {
+        _ = stderr.print("Scanning {d} {s} conversation files...\n", .{ files.len, @tagName(llm) }) catch {};
+        _ = stderr.flush() catch {};
     }
-
-    _ = stderr.print("Scanning {d} {s} conversation files...\n", .{ files.len, @tagName(llm) }) catch {};
-    _ = stderr.flush() catch {};
 
     // Get existing indexed files for incremental detection
     const indexed = try storage.getAllIndexedFiles(db, allocator);
@@ -253,7 +252,7 @@ pub fn indexAllForLlm(
 
     // Detect deleted files
     for (indexed) |item| {
-        if (!on_disk.contains(item.file_path)) {
+        if (pathIsWithinRoot(item.file_path, conversation_dir) and !on_disk.contains(item.file_path)) {
             storage.deleteMessagesByFile(db, item.file_path) catch |err| {
                 _ = stderr.print("warning: could not remove stale messages for {s}: {s}\n", .{ item.file_path, @errorName(err) }) catch {};
                 _ = stderr.flush() catch {};
@@ -277,6 +276,43 @@ pub fn indexAllForLlm(
     _ = stderr.flush() catch {};
 
     return stats;
+}
+
+/// Classify a stored file under one source root without matching sibling prefixes.
+fn pathIsWithinRoot(path: []const u8, root: []const u8) bool {
+    if (root.len == 0 or isFilesystemRoot(root) or path.len < root.len) return false;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    if (isPathSeparator(root[root.len - 1])) return true;
+    return isPathSeparator(path[root.len]);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
+fn isFilesystemRoot(path: []const u8) bool {
+    var only_separators = true;
+    for (path) |byte| only_separators = only_separators and isPathSeparator(byte);
+    if (only_separators) return true;
+    return path.len == 3 and std.ascii.isAlphabetic(path[0]) and
+        path[1] == ':' and isPathSeparator(path[2]);
+}
+
+test "source-root ownership classifies path sets without broad or sibling matches" {
+    const cases = [_]struct { path: []const u8, root: []const u8, expected: bool }{
+        .{ .path = "/home/p/.claude/projects/a/log.jsonl", .root = "/home/p/.claude/projects", .expected = true },
+        .{ .path = "/home/p/.claude/projects/a/log.jsonl", .root = "/home/p/.claude/projects/", .expected = true },
+        .{ .path = "/home/p/.claude/projects-copy/a/log.jsonl", .root = "/home/p/.claude/projects", .expected = false },
+        .{ .path = "/home/p/.codex/sessions/log.jsonl", .root = "/home/p/.claude/projects", .expected = false },
+        .{ .path = "/home/p/.claude/projects/a/log.jsonl", .root = "/", .expected = false },
+        .{ .path = "C:\\Users\\p\\.claude\\projects\\a\\log.jsonl", .root = "C:\\Users\\p\\.claude\\projects", .expected = true },
+        .{ .path = "C:\\Users\\p\\.claude\\projects-copy\\a\\log.jsonl", .root = "C:\\Users\\p\\.claude\\projects", .expected = false },
+        .{ .path = "C:\\Users\\p\\.claude\\projects\\a\\log.jsonl", .root = "C:\\", .expected = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, pathIsWithinRoot(case.path, case.root));
+    }
 }
 
 const BackfillStats = struct {
@@ -520,6 +556,85 @@ fn testEmbeddingCount(db: storage.Db) i64 {
     defer _ = c.sqlite3_finalize(stmt);
     if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
     return c.sqlite3_column_int64(stmt.?, 0);
+}
+
+fn testFtsCount(db: storage.Db) i64 {
+    const c = storage.sqlite;
+    const sql = "SELECT COUNT(*) FROM messages_fts";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return -1;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt.?) != c.SQLITE_ROW) return -1;
+    return c.sqlite3_column_int64(stmt.?, 0);
+}
+
+test "empty-source sweep expires only records inside the active source root" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const claude_root = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-stale-sweep/claude", .{tmpdir});
+    defer allocator.free(claude_root);
+    const stale_file = try std.fmt.allocPrint(allocator, "{s}/stale-project/stale.jsonl", .{claude_root});
+    defer allocator.free(stale_file);
+    const foreign_file = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-stale-sweep/codex/2026/08/05/live.jsonl", .{tmpdir});
+    defer allocator.free(foreign_file);
+    const sibling_file = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-stale-sweep/claude-copy/live.jsonl", .{tmpdir});
+    defer allocator.free(sibling_file);
+
+    const test_root = std.fs.path.dirname(claude_root).?;
+    std.Io.Dir.cwd().deleteTree(runtime.io(), test_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(runtime.io(), claude_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), test_root) catch {};
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 2 });
+    defer schema.deinit(allocator);
+
+    const stale_rowid = try storage.insertMessage(db, .{
+        .file_path = stale_file,
+        .line_number = 1,
+        .role = "user",
+        .content = "stale claude message",
+    });
+    const foreign_rowid = try storage.insertMessage(db, .{
+        .file_path = foreign_file,
+        .line_number = 1,
+        .role = "user",
+        .content = "live codex message",
+    });
+    const sibling_rowid = try storage.insertMessage(db, .{
+        .file_path = sibling_file,
+        .line_number = 1,
+        .role = "user",
+        .content = "live sibling message",
+    });
+    try storage.insertEmbedding(db, allocator, stale_rowid, &.{ 0.1, 0.2 });
+    try storage.insertEmbedding(db, allocator, foreign_rowid, &.{ 0.3, 0.4 });
+    try storage.insertEmbedding(db, allocator, sibling_rowid, &.{ 0.5, 0.6 });
+    try storage.upsertIndexedFile(db, stale_file, 1, 1);
+    try storage.upsertIndexedFile(db, foreign_file, 1, 1);
+    try storage.upsertIndexedFile(db, sibling_file, 1, 1);
+
+    var output_buffer: [512]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    const stats = try indexAllForLlm(allocator, db, claude_root, .claude, null, 16, false, &output);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.files_deleted);
+    try std.testing.expectEqual(@as(i64, 2), storage.getMessageCount(db));
+    try std.testing.expectEqual(@as(i64, 2), testFtsCount(db));
+    try std.testing.expectEqual(@as(i64, 2), testEmbeddingCount(db));
+
+    var stale = try storage.getIndexedFile(db, allocator, stale_file);
+    if (stale) |*item| item.deinit(allocator);
+    try std.testing.expect(stale == null);
+    var foreign = try storage.getIndexedFile(db, allocator, foreign_file);
+    defer if (foreign) |*item| item.deinit(allocator);
+    try std.testing.expect(foreign != null);
+    var sibling = try storage.getIndexedFile(db, allocator, sibling_file);
+    defer if (sibling) |*item| item.deinit(allocator);
+    try std.testing.expect(sibling != null);
 }
 
 test "renderBackfillProgress reports processed succeeded and failed counts" {

@@ -1,5 +1,12 @@
 # Plan
 
+- [x] Confirm which activity resets the watcher idle timeout: a successful pass that indexes or deletes files; searches and no-op polls do not reset it — completed 2026-08-05 10:56 EDT.
+- [x] Confirm and report the default `chatscan watch` idle timeout: `30m`; `never` disables retirement — completed 2026-08-05 10:54 EDT.
+- [x] Realign `chatscan rename` with current Claude and Codex storage formats, then verify the real rename plan without mutating Peter's project or logs — completed 2026-08-05 11:06 EDT.
+  - [x] Diagnose the false-empty plan: Claude normalizes punctuation to hyphens in conversation-project slugs; Codex already supports its current direct `YYYY/MM/DD` layout and truthfully has no exact-cwd session for this project; the index lookup guesses the obsolete Claude slug.
+  - [x] Keep legacy chat formats out of chatscan's migration logic; when an old format is positively identified, detect it and direct the operator to launch the owning TUI for its background upgrade.
+  - [x] Repair stale-index expiry so missing source logs remove their message, FTS, embedding, and `indexed_files` records without crossing LLM-source boundaries — completed 2026-08-05 11:06 EDT.
+  - Curiosity poke: can current-format discovery remain portable while unsupported legacy layouts are reported without teaching chatscan their particulars?
 - [x] Ported codescan self-suiciding watcher to chatscan (`chatscan watch`) — done 2026-07-29 20:20 EDT. retirement.zig (pure policy) + watch.zig (polling loop, injected clock) + CLI `watch`/--interval/--idle-timeout + config watcher_interval/watcher_idle_timeout + SIGINT/SIGTERM graceful stop. TDD: retirement suite, RetirementTracker mock-clock test, cli parse test, and a bounded CLI e2e proving self-termination.
 - [ ] (future, optional) `ollama pull bge-m3` to restore general-purpose hybrid on the 1024-dim index (no reindex needed). Deferred: evaluating jina-code-embeddings-1.5b first.
 - [ ] Evaluate jina-code-embeddings-1.5b for chatscan on CODE-related queries (its strength). Switched active index to the preserved jina/1536 index; weights are NOT jina-tuned (defaults 1.0/1.0/0.3) — experiment via --weight-vector.

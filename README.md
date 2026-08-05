@@ -41,7 +41,7 @@ chatscan "config" --json
 - **LLM source tag** — every hit is labelled with its origin CLI (`[claude]`/`[codex]`/`[gemini]`), derived from the conversation path; also in `--json` as `source`
 - **Noise exclusion** — indexing skips tool/meta conversation dirs (default: claude-mem observer sessions); extend with `CHATSCAN_IGNORE=<colon:separated:path:fragments>`
 - **Self-suiciding watcher** — `chatscan watch` keeps the index fresh (incremental re-index on a poll interval) and stands down on its own after a configurable idle timeout (`--idle-timeout 30m`, or `never`), so watchers started by a session hook never pile up
-- **Incremental indexing** — only re-indexes changed files based on mtime
+- **Incremental indexing** — only re-indexes changed files based on mtime; every pass also expires message, FTS, embedding, and file-metadata rows for missing or ignored logs inside the selected LLM source root
 - **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
 - **Pluggable embedding backends** — Ollama (default) or any OpenAI-compatible server (oMLX, LM Studio, vLLM, etc.)

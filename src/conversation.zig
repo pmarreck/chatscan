@@ -340,8 +340,8 @@ pub fn findConversationFilesForLlm(allocator: std.mem.Allocator, conversation_di
     };
 }
 
-/// Find Codex session files: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
-fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u8 {
+/// Find Codex sessions stored directly under dated `YYYY/MM/DD` directories.
+pub fn findCodexFiles(allocator: std.mem.Allocator, sessions_dir: []const u8) ![][]u8 {
     var files = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (files.items) |f| allocator.free(f);
@@ -507,6 +507,39 @@ pub fn findConversationFiles(allocator: std.mem.Allocator, conversation_dir: []c
 test "extractProjectDir" {
     const result = extractProjectDir("/home/user/.claude/projects/-Users-foo-bar/abc.jsonl");
     try std.testing.expectEqualStrings("-Users-foo-bar", result);
+}
+
+test "Codex discovery classifies the direct dated session layout" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+
+    const sessions_dir = try std.fmt.allocPrint(allocator, "{s}/chatscan-test-codex-layout", .{tmpdir});
+    defer allocator.free(sessions_dir);
+    const day_dir = try std.fmt.allocPrint(allocator, "{s}/2026/08/05", .{sessions_dir});
+    defer allocator.free(day_dir);
+    const direct_file = try std.fmt.allocPrint(allocator, "{s}/direct.jsonl", .{day_dir});
+    defer allocator.free(direct_file);
+    const noise_file = try std.fmt.allocPrint(allocator, "{s}/noise.txt", .{day_dir});
+    defer allocator.free(noise_file);
+
+    std.Io.Dir.cwd().deleteTree(runtime.io(), sessions_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(runtime.io(), day_dir);
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), sessions_dir) catch {};
+    for ([_][]const u8{ direct_file, noise_file }) |path| {
+        const file = try std.Io.Dir.cwd().createFile(runtime.io(), path, .{});
+        defer file.close(runtime.io());
+        try file.writeStreamingAll(runtime.io(), "{}\n");
+    }
+
+    const files = try findCodexFiles(allocator, sessions_dir);
+    defer {
+        for (files) |path| allocator.free(path);
+        allocator.free(files);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqualStrings(direct_file, files[0]);
 }
 
 test "extractTextContent from string" {
