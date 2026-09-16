@@ -423,6 +423,37 @@ pub fn getMessagesMissingEmbeddings(
     return pending.toOwnedSlice(allocator);
 }
 
+/// Resolve a reference only when its exact raw file and record are indexed.
+pub fn getMessageAt(db: Db, allocator: std.mem.Allocator, file_path: []const u8, line_number: i64) !?Message {
+    const sql =
+        \\SELECT id, file_path, line_number, role, content, timestamp, session_id, project_name, project_dir
+        \\FROM messages WHERE file_path = ?1 AND line_number = ?2
+        \\LIMIT 1
+    ;
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    const s = stmt.?;
+    bindText(s, 1, file_path);
+    bindInt(s, 2, line_number);
+    if (c.sqlite3_step(s) != c.SQLITE_ROW) return null;
+    return @as(?Message, try messageFromRow(allocator, s));
+}
+
+fn messageFromRow(allocator: std.mem.Allocator, s: *c.sqlite3_stmt) !Message {
+    return .{
+        .id = c.sqlite3_column_int64(s, 0),
+        .file_path = try allocator.dupe(u8, columnText(s, 1)),
+        .line_number = c.sqlite3_column_int64(s, 2),
+        .role = try allocator.dupe(u8, columnText(s, 3)),
+        .content = try allocator.dupe(u8, columnText(s, 4)),
+        .timestamp = if (columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
+        .session_id = if (columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
+        .project_name = if (columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
+        .project_dir = if (columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
+    };
+}
+
 /// Get the message at line N±offset in the same file, for sandwich context display.
 pub fn getAdjacentMessage(db: Db, allocator: std.mem.Allocator, file_path: []const u8, line_number: i64, direction: enum { prev, next }) !?Message {
     const sql = switch (direction) {
@@ -448,17 +479,7 @@ pub fn getAdjacentMessage(db: Db, allocator: std.mem.Allocator, file_path: []con
 
     if (c.sqlite3_step(s) != c.SQLITE_ROW) return null;
 
-    return Message{
-        .id = c.sqlite3_column_int64(s, 0),
-        .file_path = try allocator.dupe(u8, columnText(s, 1)),
-        .line_number = c.sqlite3_column_int64(s, 2),
-        .role = try allocator.dupe(u8, columnText(s, 3)),
-        .content = try allocator.dupe(u8, columnText(s, 4)),
-        .timestamp = if (columnTextOpt(s, 5)) |t| try allocator.dupe(u8, t) else null,
-        .session_id = if (columnTextOpt(s, 6)) |t| try allocator.dupe(u8, t) else null,
-        .project_name = if (columnTextOpt(s, 7)) |t| try allocator.dupe(u8, t) else null,
-        .project_dir = if (columnTextOpt(s, 8)) |t| try allocator.dupe(u8, t) else null,
-    };
+    return @as(?Message, try messageFromRow(allocator, s));
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -696,4 +717,19 @@ test "adjacent message retrieval" {
     var next = (try getAdjacentMessage(db, allocator, "t.jsonl", 5, .next)).?;
     defer next.deinit(allocator);
     try std.testing.expectEqualStrings("third", next.content);
+}
+
+test "exact message locator returns only the indexed source record" {
+    const allocator = std.testing.allocator;
+    const db = try openMemoryWithVec(allocator);
+    defer close(db);
+    var schema = try initSchema(allocator, db, .{ .embedding_dim = 2 });
+    defer schema.deinit(allocator);
+    _ = try insertMessage(db, .{ .file_path = "a.jsonl", .line_number = 7, .role = "assistant", .content = "target" });
+    _ = try insertMessage(db, .{ .file_path = "b.jsonl", .line_number = 7, .role = "assistant", .content = "other" });
+
+    var found = (try getMessageAt(db, allocator, "a.jsonl", 7)).?;
+    defer found.deinit(allocator);
+    try std.testing.expectEqualStrings("target", found.content);
+    try std.testing.expect((try getMessageAt(db, allocator, "a.jsonl", 8)) == null);
 }

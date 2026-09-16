@@ -28,6 +28,9 @@ chatscan --regex "indexOfIgnoreCase"
 
 # JSON output
 chatscan "config" --json
+
+# Bounded, raw-verified evidence for an agent
+chatscan recall "why was this changed" --project-exact "$PWD" --max-bytes 12000
 ```
 
 ## Features
@@ -47,6 +50,8 @@ chatscan "config" --json
 - **Pluggable embedding backends** — Ollama (default) or any OpenAI-compatible server (oMLX, LM Studio, vLLM, etc.)
 - **Env-var expansion in config** — `${VAR}` / `${VAR:-default}` so secrets like API keys stay out of committed configs
 - **Graceful degradation** — works without an embedder (lexical-only), warns and falls back automatically
+- **Bounded evidence recall** — deterministic lexical recall emits exact excerpts under a measured JSON byte limit, after reopening and verifying each raw transcript record
+- **Expandable references** — opaque references retrieve chronological surrounding turns under a separate byte limit, with duplicate-free continuation inside oversized messages
 
 ## Installation
 
@@ -112,6 +117,8 @@ Darwin.
 ```
 chatscan <query>              Search conversations (implicit)
 chatscan search <query>       Search conversations
+chatscan recall <query>       Return bounded, raw-verified evidence as JSON
+chatscan expand <ref>         Expand a recall reference as bounded JSON
 chatscan index                Index/update conversation database
 chatscan rename <old> <new>   Rename project dir + update all logs
 chatscan config               Show configuration
@@ -130,6 +137,19 @@ Search options (by default, only the CURRENT directory's project is searched):
   --mode <vector|lexical|hybrid> Search mode (default hybrid)
   --context-lines <n>           Lines to show per message (default 4)
   --json                        JSON output
+
+Recall options (deterministic lexical search; JSON output):
+  --project-exact <path>        Require an exact source-owned project path
+  --session <id>                Require an exact source-owned session ID
+  --all                         Explicitly permit recall across all projects
+  --max-bytes <n>               Bound final serialized stdout (default 12000)
+                                Loose --project matching is rejected
+
+Expand options:
+  --before <n>                  Prior visible conversation turns (default 2)
+  --after <n>                   Following visible conversation turns (default 3)
+  --max-bytes <n>               Bound final serialized stdout (default 16000)
+  --cursor <token>              Continue the same window without duplicates
 
 LLM source options:
   --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)
@@ -173,6 +193,51 @@ chatscan html --project Code/validate   # by partial path ('/' matches the store
 > Tip: if you moved/renamed a project directory (e.g. via a symlink), its older
 > conversations may be stored under the *previous* path. `--all`, or a
 > `--project` fragment common to both paths, will find them.
+
+### Bounded, verifiable recall
+
+`recall` is the agent-facing evidence path. It always uses lexical search and
+JSON, so it does not need Ollama or another embedding service. It requires an
+exact source-owned project path, an exact session ID, or an explicit `--all`:
+
+```bash
+chatscan recall "the visible conversation cuts off" \
+  --session 01a08b52-79af-79a3-8cf4-7b4305eedbf6 \
+  --max-bytes 12000 > recall.json
+
+ref="$(jq -r '.results[0].ref' recall.json)"
+chatscan expand "$ref" --before 2 --after 3 --max-bytes 16000 > context.json
+
+# Continue when context.json contains a continuation token.
+cursor="$(jq -r '.continuation // empty' context.json)"
+chatscan expand "$ref" --before 2 --after 3 \
+  --cursor "$cursor" --max-bytes 16000
+```
+
+The byte limit covers the final UTF-8 stdout, including JSON escapes,
+provenance, references, cursors, and the trailing newline. If even an empty
+envelope cannot fit, chatscan exits nonzero with `BudgetTooSmall`. Recall
+results contain exact source substrings rather than generated summaries, plus
+role, timestamp, source, session, canonical project, raw locator, SHA-256
+identity, index freshness, omissions, and `absence_is_proof: false`.
+
+Before emitting a hit, chatscan reopens its raw transcript and checks the
+indexed role, content, timestamp, and session. Missing, truncated, changed, or
+unreadable records are omitted and counted. A JSONL reference remains valid
+when new turns are appended because it hashes the raw prefix through the
+selected record; changing any byte in that prefix invalidates it. Gemini is a
+single JSON document, so any file change invalidates its reference. Expansion
+always reads the current raw source. A continuation cursor remains valid across
+benign JSONL appends when its next record and the referenced prefix are
+unchanged.
+
+Visible-turn provenance follows each current client schema. Claude contributes
+user records and finalized assistant records. Codex contributes
+`event_msg.user_message` and `event_msg.agent_message`; parallel
+`response_item.message` records, reasoning, tools, compaction records, and
+notifications are ignored. Gemini contributes `user` and `gemini` entries from
+the session's messages array. Chatscan exposes chronology and freshness but
+does not infer which matching decision is final.
 
 ### Environment overrides
 

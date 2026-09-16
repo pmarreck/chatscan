@@ -14,6 +14,7 @@ const runtime = @import("runtime.zig");
 const builtin = @import("builtin");
 const watch = @import("watch.zig");
 const retirement = @import("retirement.zig");
+const recall = @import("recall.zig");
 
 /// Set by SIGINT/SIGTERM so the watch loop can finish its current pass and exit.
 var g_watch_stop = std.atomic.Value(bool).init(false);
@@ -281,6 +282,57 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+        .expand => {
+            const reference = parsed.reference orelse {
+                _ = stderr.print("error: expand requires a reference from recall output\n", .{}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(64);
+            };
+            const max_bytes = parsed.max_bytes orelse 16_000;
+            try ensureDbDir(allocator, settings.db_path);
+            const db = try storage.openFileWithVec(allocator, settings.db_path);
+            defer storage.close(db);
+            var schema_result = try storage.initSchema(allocator, db, .{
+                .embedding_dim = settings.embedding_dim,
+                .embedding_model = settings.ollama_model,
+            });
+            defer schema_result.deinit(allocator);
+
+            var locator = recall.decodeReference(allocator, reference) catch {
+                _ = stderr.print("error: invalid recall reference\n", .{}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(64);
+            };
+            defer locator.deinit(allocator);
+            var indexed = storage.getMessageAt(db, allocator, locator.file_path, locator.line_number) catch null;
+            defer if (indexed) |*message| message.deinit(allocator);
+            if (indexed == null) {
+                _ = stderr.print("error: reference does not identify a record in the current chatscan index\n", .{}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(1);
+            }
+
+            const rendered = recall.expandReferenceWithIndexStatus(
+                allocator,
+                runtime.io(),
+                reference,
+                parsed.expand_before,
+                parsed.expand_after,
+                parsed.cursor,
+                max_bytes,
+                indexFreshness(allocator, db, locator.file_path),
+            ) catch |err| {
+                _ = stderr.print("error: expand failed: {s}\n", .{@errorName(err)}) catch {};
+                _ = stderr.flush() catch {};
+                std.process.exit(if (err == error.BudgetTooSmall) 64 else 1);
+            };
+            defer allocator.free(rendered);
+            try stdout.writeAll(rendered);
+            try stdout.flush();
+        },
+        .recall => {
+            try handleRecall(allocator, parsed, settings, stdout, stderr);
+        },
         .search => {
             const query = parsed.query orelse {
                 _ = stderr.print("error: no search query provided\n", .{}) catch {};
@@ -394,6 +446,202 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         },
     }
+}
+
+const RecallCandidate = struct {
+    result_index: usize,
+    verification: recall.RawVerification,
+    reference: []u8,
+
+    fn deinit(self: *RecallCandidate, allocator: std.mem.Allocator) void {
+        self.verification.deinit(allocator);
+        allocator.free(self.reference);
+    }
+};
+
+fn handleRecall(
+    allocator: std.mem.Allocator,
+    parsed: cli.Parsed,
+    settings: Settings,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const query = parsed.query orelse {
+        _ = stderr.print("error: recall requires a query\n", .{}) catch {};
+        _ = stderr.flush() catch {};
+        std.process.exit(64);
+    };
+    if (settings.project != null) {
+        _ = stderr.print("error: recall does not accept loose --project matching; use --project-exact, --session, or --all\n", .{}) catch {};
+        _ = stderr.flush() catch {};
+        std.process.exit(64);
+    }
+    if (parsed.project_exact == null and parsed.session_filter == null and !settings.all_projects) {
+        _ = stderr.print("error: recall requires --project-exact <path>, --session <id>, or explicit --all\n", .{}) catch {};
+        _ = stderr.flush() catch {};
+        std.process.exit(64);
+    }
+
+    const max_bytes = parsed.max_bytes orelse 12_000;
+    try ensureDbDir(allocator, settings.db_path);
+    const db = try storage.openFileWithVec(allocator, settings.db_path);
+    defer storage.close(db);
+    var schema_result = try storage.initSchema(allocator, db, .{
+        .embedding_dim = settings.embedding_dim,
+        .embedding_model = settings.ollama_model,
+    });
+    defer schema_result.deinit(allocator);
+
+    const candidate_limit: usize = if (parsed.project_exact != null) @max(settings.top_n * 100, 1000) else settings.top_n;
+    const sr = search_mod.search(allocator, db, null, query, .{
+        .top_n = candidate_limit,
+        .candidate_multiplier = 5,
+        .mode = .lexical,
+        .score_dropoff = 0,
+        .role_filter = settings.role_filter,
+        .session_filter = parsed.session_filter,
+        .deduplicate_conversations = false,
+        .since = parsed.since,
+        .until = parsed.until,
+    }) catch |err| {
+        _ = stderr.print("error: recall search failed: {s}\n", .{@errorName(err)}) catch {};
+        _ = stderr.flush() catch {};
+        std.process.exit(1);
+    };
+    defer search_mod.freeResults(allocator, sr.results);
+
+    var candidates = std.ArrayListUnmanaged(RecallCandidate).empty;
+    defer {
+        for (candidates.items) |*candidate| candidate.deinit(allocator);
+        candidates.deinit(allocator);
+    }
+    var omitted_stale: usize = 0;
+    var omitted_unverifiable: usize = 0;
+    for (sr.results, 0..) |result, index| {
+        const source = config.LlmSource.fromPath(result.message.file_path);
+        var verification = recall.verifyIndexedClaim(allocator, runtime.io(), .{
+            .file_path = result.message.file_path,
+            .line_number = result.message.line_number,
+            .role = result.message.role,
+            .content = result.message.content,
+            .timestamp = result.message.timestamp,
+            .session_id = result.message.session_id,
+            .project_name = result.message.project_name,
+            .project_dir = result.message.project_dir,
+        }, source) catch |err| {
+            switch (err) {
+                error.SourceMissing, error.SourceChanged, error.SourceTruncated => omitted_stale += 1,
+                else => omitted_unverifiable += 1,
+            }
+            continue;
+        };
+
+        if (parsed.project_exact) |expected_project| {
+            const actual_project = verification.canonical_project orelse {
+                verification.deinit(allocator);
+                omitted_unverifiable += 1;
+                continue;
+            };
+            if (!canonicalPathsEqual(allocator, expected_project, actual_project)) {
+                verification.deinit(allocator);
+                continue;
+            }
+        }
+        if (parsed.session_filter) |expected_session| {
+            const actual_session = verification.source_session_id orelse verification.message.session_id orelse {
+                verification.deinit(allocator);
+                omitted_unverifiable += 1;
+                continue;
+            };
+            if (!std.mem.eql(u8, actual_session, expected_session)) {
+                verification.deinit(allocator);
+                continue;
+            }
+        }
+
+        const reference = recall.encodeReference(allocator, .{
+            .file_path = result.message.file_path,
+            .line_number = result.message.line_number,
+            .role = result.message.role,
+            .content = result.message.content,
+            .timestamp = result.message.timestamp,
+            .session_id = result.message.session_id,
+            .project_name = result.message.project_name,
+            .project_dir = result.message.project_dir,
+        }, source, verification) catch {
+            verification.deinit(allocator);
+            omitted_unverifiable += 1;
+            continue;
+        };
+        candidates.append(allocator, .{
+            .result_index = index,
+            .verification = verification,
+            .reference = reference,
+        }) catch |err| {
+            verification.deinit(allocator);
+            allocator.free(reference);
+            return err;
+        };
+        if (candidates.items.len >= settings.top_n) break;
+    }
+
+    const hits = try allocator.alloc(recall.VerifiedHit, candidates.items.len);
+    defer allocator.free(hits);
+    for (candidates.items, 0..) |*candidate, index| {
+        const result = sr.results[candidate.result_index];
+        const verification = &candidate.verification;
+        hits[index] = .{
+            .reference = candidate.reference,
+            .role = verification.message.role,
+            .content = verification.message.content,
+            .timestamp = verification.message.timestamp,
+            .source = config.LlmSource.fromPath(result.message.file_path).label(),
+            .session_id = verification.source_session_id orelse verification.message.session_id,
+            .project = verification.canonical_project orelse verification.message.project_name,
+            .file_path = result.message.file_path,
+            .line_number = result.message.line_number,
+            .content_sha256 = &verification.content_sha256,
+            .source_prefix_sha256 = &verification.source_prefix_sha256,
+            .source_prefix_bytes = verification.source_prefix_bytes,
+            .index_freshness = indexFreshness(allocator, db, result.message.file_path),
+        };
+    }
+
+    const rendered = recall.renderRecall(allocator, .{
+        .query = query,
+        .project = parsed.project_exact,
+        .session_id = parsed.session_filter,
+        .total_index_matches = sr.total_relevant,
+        .omitted_stale = omitted_stale,
+        .omitted_unverifiable = omitted_unverifiable,
+    }, hits, max_bytes) catch |err| {
+        _ = stderr.print("error: recall failed: {s}\n", .{@errorName(err)}) catch {};
+        _ = stderr.flush() catch {};
+        std.process.exit(if (err == error.BudgetTooSmall) 64 else 1);
+    };
+    defer allocator.free(rendered);
+    try stdout.writeAll(rendered);
+    try stdout.flush();
+}
+
+fn canonicalPathsEqual(allocator: std.mem.Allocator, expected: []const u8, actual: []const u8) bool {
+    if (std.mem.eql(u8, expected, actual)) return true;
+    const expected_real = std.Io.Dir.cwd().realPathFileAlloc(runtime.io(), expected, allocator) catch return false;
+    defer allocator.free(expected_real);
+    const actual_real = std.Io.Dir.cwd().realPathFileAlloc(runtime.io(), actual, allocator) catch return false;
+    defer allocator.free(actual_real);
+    return std.mem.eql(u8, expected_real, actual_real);
+}
+
+fn indexFreshness(allocator: std.mem.Allocator, db: storage.Db, path: []const u8) []const u8 {
+    var indexed = storage.getIndexedFile(db, allocator, path) catch return "unknown";
+    defer if (indexed) |*item| item.deinit(allocator);
+    const stored = indexed orelse return "unknown";
+    const file = std.Io.Dir.cwd().openFile(runtime.io(), path, .{}) catch return "missing";
+    defer file.close(runtime.io());
+    const stat = file.stat(runtime.io()) catch return "unknown";
+    const current_mtime: i64 = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
+    return if (stored.mtime_ns == current_mtime) "current" else "mtime-mismatch";
 }
 
 /// Resolve one RRF weight: CLI flag > env var > config > default.
@@ -811,6 +1059,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Usage:
         \\  chatscan <query>              Search conversations (implicit)
         \\  chatscan search <query>       Search conversations
+        \\  chatscan recall <query>       Return bounded, raw-verified evidence as JSON
+        \\  chatscan expand <ref>         Expand a recall reference as bounded JSON
         \\  chatscan index                Index/update conversation database
         \\  chatscan rename <old> <new>    Rename project dir + update all logs
         \\  chatscan config               Show configuration
@@ -829,6 +1079,19 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --mode <vector|lexical|hybrid> Search mode (default hybrid)
         \\  --context-lines <n>           Lines to show per message (default 4)
         \\  --json                        JSON output
+        \\
+        \\Recall options (deterministic lexical search; JSON output):
+        \\  --project-exact <path>        Require an exact source-owned project path
+        \\  --session <id>                Require an exact source-owned session ID
+        \\  --all                         Explicitly permit recall across all projects
+        \\  --max-bytes <n>               Bound final serialized stdout (default 12000)
+        \\                                Loose --project matching is rejected
+        \\
+        \\Expand options:
+        \\  --before <n>                  Prior visible conversation turns (default 2)
+        \\  --after <n>                   Following visible conversation turns (default 3)
+        \\  --max-bytes <n>               Bound final serialized stdout (default 16000)
+        \\  --cursor <token>              Continue the same window without duplicates
         \\
         \\Ranking options (hybrid mode):
         \\  --weight-vector <f>           Semantic/embedding weight (default 1.0)

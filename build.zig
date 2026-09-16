@@ -11,7 +11,6 @@ pub fn build(b: *std.Build) void {
     const sqlite3_lib = sqlite_vec_dep.artifact("sqlite3");
     const vec_static_lib = sqlite_vec_dep.artifact("sqlite_vec0");
 
-
     const main_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -48,6 +47,7 @@ pub fn build(b: *std.Build) void {
         "src/conversation.zig",
         "src/indexer.zig",
         "src/search.zig",
+        "src/recall.zig",
         "src/ripgrep.zig",
         "src/output.zig",
         "src/ollama.zig",

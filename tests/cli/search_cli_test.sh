@@ -152,6 +152,78 @@ assert_eq 0 "$(count html --all --date 2026-03-03)" "--date 2026-03-03 (gamma da
 date_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --since 2026-13-99 2>&1 >/dev/null)"
 assert_contains "$date_err" "YYYY-MM-DD" "an invalid --since date reports a clear format error"
 
+# --- 11. Bounded, source-verified recall and expansion -----------------------
+help_out="$("$BIN" --help 2>/dev/null)"
+assert_contains "$help_out" "chatscan recall" "help documents bounded recall"
+assert_contains "$help_out" "chatscan expand" "help documents reference expansion"
+assert_contains "$help_out" "--project-exact" "help documents canonical project scope"
+assert_contains "$help_out" "--max-bytes" "help documents the serialized byte bound"
+assert_contains "$help_out" "--cursor" "help documents expansion continuation"
+
+recall_json="$WORK/recall.json"
+CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" \
+	"$BIN" recall html --project-exact /proj/alpha --max-bytes 1400 >"$recall_json" 2>"$WORK/recall.err"
+recall_rc=$?
+recall_bytes="$(wc -c <"$recall_json" | tr -d ' ')"
+assert_eq 0 "$recall_rc" "project-exact recall exits 0 without an embedding service"
+if jq -e . "$recall_json" >/dev/null 2>&1; then pass "recall stdout is independently valid JSON"; else fail "recall stdout is independently valid JSON"; fi
+assert_eq "$recall_bytes" "$(jq -r '.serialized_bytes' "$recall_json")" "recall reports the externally measured final stdout bytes"
+if [ "$recall_bytes" -le 1400 ]; then pass "recall obeys the final serialized byte limit"; else fail "recall obeys the final serialized byte limit" "emitted $recall_bytes bytes"; fi
+assert_eq "chatscan/recall-v1" "$(jq -r '.schema' "$recall_json")" "recall exposes its versioned schema"
+assert_eq 1 "$(jq -r '.results | length' "$recall_json")" "exact project recall cannot leak beta's matching hit"
+assert_eq /proj/alpha "$(jq -r '.results[0].project' "$recall_json")" "recall reports source-owned canonical project"
+assert_eq a1 "$(jq -r '.results[0].session_id' "$recall_json")" "recall reports source-owned session identity"
+assert_eq false "$(jq -r '.absence_is_proof' "$recall_json")" "recall never presents absence as proof"
+
+session_json="$WORK/session-recall.json"
+CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" \
+	"$BIN" recall html --session b1 --max-bytes 1400 >"$session_json" 2>"$WORK/session-recall.err"
+assert_eq 1 "$(jq -r '.results | length' "$session_json")" "exact session recall selects one matching transcript"
+assert_eq /proj/beta "$(jq -r '.results[0].project' "$session_json")" "exact session recall does not leak another session"
+
+empty_json="$WORK/empty-recall.json"
+CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" \
+	"$BIN" recall html --project-exact /proj/gamma --max-bytes 1400 >"$empty_json" 2>"$WORK/empty-recall.err"
+assert_eq 0 "$(jq -r '.results | length' "$empty_json")" "no-hit recall returns an honest empty result set"
+assert_eq false "$(jq -r '.absence_is_proof' "$empty_json")" "no-hit recall still disclaims proof of absence"
+
+ref="$(jq -r '.results[0].ref' "$recall_json")"
+expand_json="$WORK/expand.json"
+CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" \
+	"$BIN" expand "$ref" --before 0 --after 1 --max-bytes 4000 >"$expand_json" 2>"$WORK/expand.err"
+expand_rc=$?
+expand_bytes="$(wc -c <"$expand_json" | tr -d ' ')"
+assert_eq 0 "$expand_rc" "source expansion exits 0"
+if jq -e . "$expand_json" >/dev/null 2>&1; then pass "expand stdout is independently valid JSON"; else fail "expand stdout is independently valid JSON"; fi
+assert_eq "$expand_bytes" "$(jq -r '.serialized_bytes' "$expand_json")" "expand reports the externally measured final stdout bytes"
+if [ "$expand_bytes" -le 4000 ]; then pass "expand obeys the final serialized byte limit"; else fail "expand obeys the final serialized byte limit" "emitted $expand_bytes bytes"; fi
+assert_eq current "$(jq -r '.source_status.index' "$expand_json")" "expand reports current index freshness separately from raw verification"
+assert_eq "how do I render html output in the browser|the dirtree command gives a nice project overview" "$(jq -r '[.messages[].chunk.text] | join("|")' "$expand_json")" "expand preserves chronological surrounding turns"
+
+loose_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" recall html --project alpha 2>&1 >/dev/null)"
+loose_rc=$?
+if [ "$loose_rc" -ne 0 ]; then pass "recall rejects loose project scope"; else fail "recall rejects loose project scope"; fi
+assert_contains "$loose_err" "does not accept loose --project" "loose project failure explains the exact-scope requirement"
+
+scope_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" recall html 2>&1 >/dev/null)"
+scope_rc=$?
+if [ "$scope_rc" -ne 0 ]; then pass "recall requires an explicit exact scope"; else fail "recall requires an explicit exact scope"; fi
+assert_contains "$scope_err" "requires --project-exact" "missing scope failure lists accepted scopes"
+
+tiny_out="$WORK/tiny-recall.out"
+CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" \
+	"$BIN" recall html --all --max-bytes 10 >"$tiny_out" 2>"$WORK/tiny-recall.err"
+tiny_rc=$?
+tiny_err="$(cat "$WORK/tiny-recall.err")"
+if [ "$tiny_rc" -ne 0 ]; then pass "a budget smaller than the envelope fails nonzero"; else fail "a budget smaller than the envelope fails nonzero"; fi
+assert_eq 0 "$(wc -c <"$tiny_out" | tr -d ' ')" "tiny-budget failure emits no oversized stdout"
+assert_contains "$tiny_err" "BudgetTooSmall" "tiny-budget failure is explicit"
+
+cursor_err="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" expand "$ref" --cursor malformed --max-bytes 1400 2>&1 >/dev/null)"
+cursor_rc=$?
+if [ "$cursor_rc" -ne 0 ]; then pass "malformed continuation cursor fails nonzero"; else fail "malformed continuation cursor fails nonzero"; fi
+assert_contains "$cursor_err" "InvalidCursor" "malformed cursor failure is explicit"
+
 # --- LLM source provenance tag (F: derive from file_path) --------------------
 src_json="$(CHATSCAN_DB="$DB" CHATSCAN_CONVERSATION_DIR="$FIX" "$BIN" html --all --mode lexical --json 2>/dev/null | jq -r ".results[0].source")"
 assert_eq "claude" "$src_json" "json output tags each hit with source=claude (fixtures live under a claude-style path)"

@@ -1,5 +1,14 @@
 # Plan
 
+- [x] Implement byte-bounded `recall` and source-verified `expand` for post-compaction evidence, then hand an exact candidate binary and test commands to Einstein for independent review and live acceptance — candidate completed 2026-09-16 18:52 EDT.
+  - [x] Recover current search, output, index-schema, and source-parser contracts; specify stable references, exact project/session scoping, freshness states, and continuation semantics — completed 2026-09-16 18:45 EDT.
+  - [x] TDD the final serialized-byte budget, including JSON escaping, Unicode, minimal-envelope failure, huge single-message continuation, and duplicate-free paging — completed 2026-09-16 18:45 EDT.
+  - [x] TDD raw-source verification and source-schema fidelity for supported Claude, Codex, and Gemini fixtures, including changed, missing, replaced, truncated, and appended sources — completed 2026-09-16 18:45 EDT.
+  - [x] TDD CLI parsing/help/errors, exact session and canonical-project isolation, deterministic lexical recall without an embedding service, chronology, omissions, and honest no-hit output — completed 2026-09-16 18:45 EDT.
+  - [x] Document the implemented contract, run the complete suite/build, commit a known-green candidate, and report it to Einstein through `$HOME/inbox` without embedding transcript content — candidate completed 2026-09-16 18:52 EDT.
+  - Curiosity poke: can every displayed byte be traced to a freshly verified source while a cursor remains stable enough to resume inside an oversized message after benign append-only growth?
+- [ ] Add native Grok Build conversation indexing from `GROK_HOME/sessions`, preserving ACP message roles and incremental identity; queued behind the authorized bounded-recall work from Einstein's 2026-09-02 request.
+  - Curiosity poke: how should duplicate session UUIDs across encoded cwd groups fail deterministically without trusting directory slugs over `summary.json` metadata?
 - [x] Diagnose the live `chatscan rename` stall without interrupting it or risking the partially renamed project, reproduce the blocking phase, and repair it TDD-first — completed 2026-08-05 12:23 EDT.
   - [x] Record the cross-project Zig 0.16 prompt-reader lesson in shared `~/MEMORIES`; the full memory root validates — completed 2026-08-05 12:17 EDT.
   - Curiosity poke: did the command block before mutation on confirmation input, during an atomic directory move, while rewriting a log, or inside SQLite locking/work proportional to the full index?

@@ -7,6 +7,7 @@ comptime {
     _ = @import("retirement.zig");
     _ = @import("watch.zig");
     _ = @import("search.zig");
+    _ = @import("recall.zig");
     _ = @import("ripgrep.zig");
     _ = @import("output.zig");
     _ = @import("ollama.zig");

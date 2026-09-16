@@ -10,6 +10,7 @@ annotate=[
 	flake.nix = Nix package, dependency cache, dev shell, and sandboxed full-suite CI derivation
 	src/indexer.zig = Incremental conversation indexer with batched embedding generation, resumable missing-vector repair, and progress reporting.
 	src/ollama.zig = Ollama HTTP adapter; verifies installed models and actively warms idle models with a readiness embedding.
+	src/recall.zig = Byte-bounded raw transcript verification, references, excerpts, and duplicate-free expansion cursors
 	src/storage.zig = SQLite/sqlite-vec persistence, including bounded retrieval of messages missing semantic embeddings.
 	test = Full runner: build, ReleaseSafe Zig tests, CLI integration, and non-recursive Nix-check mode
 	tests/ci_contract = CI-honesty control for build, ReleaseSafe tests, CLI tests, portable CPU, and failure propagation

@@ -12,6 +12,8 @@ pub const CommandTag = enum {
     about,
     index,
     search,
+    recall,
+    expand,
     config,
     rename,
     watch,
@@ -68,6 +70,8 @@ pub const Parsed = struct {
     context_lines: usize = 4,
     all_projects: bool = false,
     project: ?[]const u8 = null,
+    project_exact: ?[]const u8 = null,
+    session_filter: ?[]const u8 = null,
     since: ?[]const u8 = null,
     until: ?[]const u8 = null,
     regex_mode: bool = false,
@@ -79,6 +83,11 @@ pub const Parsed = struct {
     weight_recency: ?f32 = null,
     watch_interval_s: ?u64 = null,
     watch_idle_timeout: ?[]const u8 = null,
+    max_bytes: ?usize = null,
+    cursor: ?[]const u8 = null,
+    expand_before: usize = 2,
+    expand_after: usize = 3,
+    reference: ?[]const u8 = null,
 
     // Rename args
     rename_old: ?[]const u8 = null,
@@ -112,6 +121,8 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
 
     var i: usize = 1;
     var verb_seen = false;
+    var ambiguous_before: ?[]const u8 = null;
+    var ambiguous_after: ?[]const u8 = null;
 
     while (i < args.len) {
         const arg = args[i];
@@ -157,6 +168,20 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--project-exact")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.project_exact = args[i];
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--session")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.session_filter = args[i];
+                i += 1;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--role")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
@@ -168,7 +193,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
-            if (std.mem.eql(u8, arg, "--since") or std.mem.eql(u8, arg, "--after")) {
+            if (std.mem.eql(u8, arg, "--since")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 if (!isValidDate(args[i])) return error.InvalidDate;
@@ -176,11 +201,25 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
-            if (std.mem.eql(u8, arg, "--until") or std.mem.eql(u8, arg, "--before")) {
+            if (std.mem.eql(u8, arg, "--until")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 if (!isValidDate(args[i])) return error.InvalidDate;
                 parsed.until = args[i];
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--after")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                ambiguous_after = args[i];
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--before")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                ambiguous_before = args[i];
                 i += 1;
                 continue;
             }
@@ -259,6 +298,20 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 parsed.context_lines = try std.fmt.parseInt(usize, args[i], 10);
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--max-bytes")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.max_bytes = std.fmt.parseInt(usize, args[i], 10) catch return error.InvalidBudget;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--cursor")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                parsed.cursor = args[i];
                 i += 1;
                 continue;
             }
@@ -375,6 +428,25 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
                 i += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "recall")) {
+                parsed.command = .recall;
+                parsed.output = .json;
+                if (!parsed.seen.search_mode) parsed.search_mode = .lexical;
+                verb_seen = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "expand")) {
+                parsed.command = .expand;
+                parsed.output = .json;
+                verb_seen = true;
+                i += 1;
+                if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+                    parsed.reference = args[i];
+                    i += 1;
+                }
+                continue;
+            }
             if (std.mem.eql(u8, arg, "config")) {
                 parsed.command = .config;
                 verb_seen = true;
@@ -407,6 +479,15 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
             }
         }
 
+        // The expand reference is positional, but named options may appear
+        // between the verb and that reference.
+        if (parsed.command == .expand and parsed.reference == null) {
+            parsed.reference = arg;
+            i += 1;
+            continue;
+        }
+        if (parsed.command == .expand) return error.UnexpectedArgument;
+
         // Accumulate as query token
         try query_parts.append(allocator, arg);
         if (!verb_seen) {
@@ -414,6 +495,20 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Parsed {
             verb_seen = true;
         }
         i += 1;
+    }
+
+    if (parsed.command == .expand) {
+        if (ambiguous_before) |value| parsed.expand_before = std.fmt.parseInt(usize, value, 10) catch return error.InvalidTurnCount;
+        if (ambiguous_after) |value| parsed.expand_after = std.fmt.parseInt(usize, value, 10) catch return error.InvalidTurnCount;
+    } else {
+        if (ambiguous_before) |value| {
+            if (!isValidDate(value)) return error.InvalidDate;
+            parsed.until = value;
+        }
+        if (ambiguous_after) |value| {
+            if (!isValidDate(value)) return error.InvalidDate;
+            parsed.since = value;
+        }
     }
 
     // Join query parts
@@ -460,6 +555,39 @@ test "parse explicit search" {
     try std.testing.expectEqualStrings("hello", parsed.query.?);
     try std.testing.expectEqual(@as(usize, 5), parsed.top_n);
     try std.testing.expectEqual(OutputFormat.json, parsed.output);
+}
+
+test "parse recall uses deterministic lexical JSON and bounded exact scope options" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{
+        "chatscan",        "--max-bytes",          "12000",     "recall",    "visible conversation",
+        "--project-exact", "/home/p/Code/example", "--session", "session-1",
+    };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(CommandTag.recall, parsed.command);
+    try std.testing.expectEqualStrings("visible conversation", parsed.query.?);
+    try std.testing.expectEqual(search.SearchMode.lexical, parsed.search_mode);
+    try std.testing.expectEqual(OutputFormat.json, parsed.output);
+    try std.testing.expectEqual(@as(?usize, 12000), parsed.max_bytes);
+    try std.testing.expectEqualStrings("/home/p/Code/example", parsed.project_exact.?);
+    try std.testing.expectEqualStrings("session-1", parsed.session_filter.?);
+}
+
+test "parse expand accepts turn counts in any argument order" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{
+        "chatscan", "expand",   "--before",    "2",     "--after", "3", "csr1.abc",
+        "--cursor", "csc1.xyz", "--max-bytes", "16000",
+    };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(CommandTag.expand, parsed.command);
+    try std.testing.expectEqualStrings("csr1.abc", parsed.reference.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.expand_before);
+    try std.testing.expectEqual(@as(usize, 3), parsed.expand_after);
+    try std.testing.expectEqual(@as(?usize, 16000), parsed.max_bytes);
+    try std.testing.expectEqualStrings("csc1.xyz", parsed.cursor.?);
 }
 
 test "parse index command" {

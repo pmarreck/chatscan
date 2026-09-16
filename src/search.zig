@@ -30,6 +30,8 @@ pub const Options = struct {
     role_filter: ?[]const u8 = null,
     project_filter: ?[]const u8 = null,
     project_dir_filter: ?[]const u8 = null,
+    session_filter: ?[]const u8 = null,
+    deduplicate_conversations: bool = true,
     since: ?[]const u8 = null,
     until: ?[]const u8 = null,
 };
@@ -158,6 +160,9 @@ pub fn search(
                     if (!std.mem.eql(u8, mpd, pd)) keep = false;
                 } else keep = false;
             }
+            if (options.session_filter) |session| {
+                if (!sessionMatches(res.message.session_id, res.message.file_path, session)) keep = false;
+            }
             if (options.since != null or options.until != null) {
                 if (!dateInRange(res.message.timestamp, options.since, options.until)) keep = false;
             }
@@ -221,7 +226,7 @@ pub fn search(
     // best message; later messages from the same conversation are dropped so the
     // list surfaces DISTINCT conversations, not fragments of one. In-place
     // compaction (write <= read always) avoids aliasing the payload pointers.
-    {
+    if (options.deduplicate_conversations) {
         var seen_conv = std.StringHashMapUnmanaged(void){};
         defer seen_conv.deinit(allocator);
         var write: usize = 0;
@@ -385,7 +390,8 @@ fn projectLikePattern(allocator: std.mem.Allocator, filter: []const u8) ![]u8 {
 /// True when any metadata filter (role/project/date) is active.
 fn anyFilterActive(o: Options) bool {
     return o.role_filter != null or o.project_filter != null or
-        o.project_dir_filter != null or o.since != null or o.until != null;
+        o.project_dir_filter != null or o.session_filter != null or
+        o.since != null or o.until != null;
 }
 
 fn appendFilterClauses(w: *std.Io.Writer, prefix: []const u8, o: Options) !void {
@@ -393,6 +399,7 @@ fn appendFilterClauses(w: *std.Io.Writer, prefix: []const u8, o: Options) !void 
     if (o.since != null) try w.print(" AND substr({s}timestamp, 1, 10) >= ?", .{prefix});
     if (o.until != null) try w.print(" AND substr({s}timestamp, 1, 10) <= ?", .{prefix});
     if (o.project_dir_filter != null) try w.print(" AND {s}project_dir = ?", .{prefix});
+    if (o.session_filter != null) try w.print(" AND ({s}session_id = ? OR {s}file_path LIKE '%' || ? || '.jsonl')", .{ prefix, prefix });
     if (o.project_filter != null) try w.print(" AND ({s}project_name LIKE ? OR {s}project_dir LIKE ?)", .{ prefix, prefix });
 }
 
@@ -413,6 +420,12 @@ fn bindActiveFilters(s: *sqlite.sqlite3_stmt, start: c_int, o: Options, proj_pat
         idx += 1;
     }
     if (o.project_dir_filter) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
+    }
+    if (o.session_filter) |v| {
+        storage.bindTextPub(s, idx, v);
+        idx += 1;
         storage.bindTextPub(s, idx, v);
         idx += 1;
     }
@@ -671,6 +684,20 @@ pub fn projectMatches(project_name: ?[]const u8, project_dir: ?[]const u8, filte
     return false;
 }
 
+/// Match a canonical session identity. Current Codex indexes may lack the
+/// session_id column, so accept only exact UUID filename forms as a fallback.
+pub fn sessionMatches(session_id: ?[]const u8, file_path: []const u8, filter: []const u8) bool {
+    if (session_id) |stored| {
+        if (std.mem.eql(u8, stored, filter)) return true;
+    }
+    const basename = std.fs.path.basename(file_path);
+    if (!std.mem.endsWith(u8, basename, ".jsonl")) return false;
+    const stem = basename[0 .. basename.len - ".jsonl".len];
+    if (std.mem.eql(u8, stem, filter)) return true;
+    if (stem.len <= filter.len or !std.mem.endsWith(u8, stem, filter)) return false;
+    return stem[stem.len - filter.len - 1] == '-';
+}
+
 /// Inclusive day-range filter: keep a message whose timestamp's date (YYYY-MM-DD)
 /// falls within [since, until]. Bounds are "YYYY-MM-DD" (or null). ISO-8601
 /// timestamps sort lexicographically, so we compare the leading 10-char date slice.
@@ -688,8 +715,6 @@ pub fn dateInRange(timestamp: ?[]const u8, since: ?[]const u8, until: ?[]const u
     }
     return true;
 }
-
-
 
 /// Number of results worth showing (F2): those scoring at or above `threshold`,
 /// with `scores` sorted descending. The caller picks the threshold per mode so
@@ -811,7 +836,6 @@ test "search with zero top_n returns empty" {
     try std.testing.expectEqual(@as(usize, 0), sr.results.len);
 }
 
-
 test "projectMatches: partial name/path, case-insensitive, classifier over a set" {
     // Exact name still matches.
     try std.testing.expect(projectMatches("codescan", "-Users-pmarreck-Code-codescan", "codescan"));
@@ -836,6 +860,56 @@ test "projectMatches: partial name/path, case-insensitive, classifier over a set
     try std.testing.expect(projectMatches("codescan", null, ""));
 }
 
+test "sessionMatches accepts exact metadata or filename identity and rejects substrings over a set" {
+    const cases = [_]struct {
+        stored: ?[]const u8,
+        path: []const u8,
+        filter: []const u8,
+        expected: bool,
+    }{
+        .{ .stored = "abc-123", .path = "/logs/unrelated.jsonl", .filter = "abc-123", .expected = true },
+        .{ .stored = null, .path = "/sessions/abc-123.jsonl", .filter = "abc-123", .expected = true },
+        .{ .stored = null, .path = "/sessions/rollout-date-abc-123.jsonl", .filter = "abc-123", .expected = true },
+        .{ .stored = "abc-1234", .path = "/sessions/abc-1234.jsonl", .filter = "abc-123", .expected = false },
+        .{ .stored = null, .path = "/sessions/prefix-abc-123-suffix.jsonl", .filter = "abc-123", .expected = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, sessionMatches(case.stored, case.path, case.filter));
+    }
+}
+
+test "recall-style search can retain multiple matching turns from one session" {
+    const allocator = std.testing.allocator;
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 2 });
+    defer schema.deinit(allocator);
+    _ = try storage.insertMessage(db, .{
+        .file_path = "session.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "decision uses the first plan",
+        .session_id = "same-session",
+    });
+    _ = try storage.insertMessage(db, .{
+        .file_path = "session.jsonl",
+        .line_number = 9,
+        .role = "assistant",
+        .content = "decision corrected by the later plan",
+        .session_id = "same-session",
+    });
+
+    const results = try search(allocator, db, null, "decision", .{
+        .mode = .lexical,
+        .top_n = 10,
+        .score_dropoff = 0,
+        .session_filter = "same-session",
+        .deduplicate_conversations = false,
+    });
+    defer freeResults(allocator, results.results);
+    try std.testing.expectEqual(@as(usize, 2), results.results.len);
+}
+
 test "lexical search finds indexed messages and --project partial-path filter narrows over a set" {
     const allocator = std.testing.allocator;
     const db = try storage.openMemoryWithVec(allocator);
@@ -845,14 +919,24 @@ test "lexical search finds indexed messages and --project partial-path filter na
 
     // Two different projects, both mentioning "html".
     _ = try storage.insertMessage(db, .{
-        .file_path = "a.jsonl", .line_number = 1, .role = "user",
-        .content = "how do I render html here", .timestamp = null, .session_id = null,
-        .project_name = "codescan", .project_dir = "-Users-pmarreck-Code-codescan",
+        .file_path = "a.jsonl",
+        .line_number = 1,
+        .role = "user",
+        .content = "how do I render html here",
+        .timestamp = null,
+        .session_id = null,
+        .project_name = "codescan",
+        .project_dir = "-Users-pmarreck-Code-codescan",
     });
     _ = try storage.insertMessage(db, .{
-        .file_path = "b.jsonl", .line_number = 1, .role = "user",
-        .content = "the html output looks wrong", .timestamp = null, .session_id = null,
-        .project_name = "validate", .project_dir = "-Users-pmarreck-Code-validate",
+        .file_path = "b.jsonl",
+        .line_number = 1,
+        .role = "user",
+        .content = "the html output looks wrong",
+        .timestamp = null,
+        .session_id = null,
+        .project_name = "validate",
+        .project_dir = "-Users-pmarreck-Code-validate",
     });
 
     // Baseline (the previously-untested core contract): lexical search finds BOTH across projects.
@@ -862,7 +946,9 @@ test "lexical search finds indexed messages and --project partial-path filter na
 
     // Narrow to just codescan using a PARTIAL PATH fragment.
     const scoped = try search(allocator, db, null, "html", .{
-        .mode = .lexical, .top_n = 10, .project_filter = "Code/codescan",
+        .mode = .lexical,
+        .top_n = 10,
+        .project_filter = "Code/codescan",
     });
     defer freeResults(allocator, scoped.results);
     try std.testing.expectEqual(@as(usize, 1), scoped.results.len);
@@ -870,12 +956,13 @@ test "lexical search finds indexed messages and --project partial-path filter na
 
     // A non-matching filter yields nothing (and is not an error).
     const none = try search(allocator, db, null, "html", .{
-        .mode = .lexical, .top_n = 10, .project_filter = "no-such-project",
+        .mode = .lexical,
+        .top_n = 10,
+        .project_filter = "no-such-project",
     });
     defer freeResults(allocator, none.results);
     try std.testing.expectEqual(@as(usize, 0), none.results.len);
 }
-
 
 test "vector-mode search over an in-memory sqlite-vec index does not crash" {
     const allocator = std.testing.allocator;
@@ -889,9 +976,14 @@ test "vector-mode search over an in-memory sqlite-vec index does not crash" {
     var n: usize = 0;
     while (n < 20) : (n += 1) {
         const rowid = try storage.insertMessage(db, .{
-            .file_path = "a.jsonl", .line_number = @intCast(n + 1), .role = "user",
-            .content = "vector target about html and dirtree", .timestamp = null, .session_id = null,
-            .project_name = "alpha", .project_dir = "-x-alpha",
+            .file_path = "a.jsonl",
+            .line_number = @intCast(n + 1),
+            .role = "user",
+            .content = "vector target about html and dirtree",
+            .timestamp = null,
+            .session_id = null,
+            .project_name = "alpha",
+            .project_dir = "-x-alpha",
         });
         var vec: [1024]f32 = undefined;
         for (&vec, 0..) |*e, i| e.* = @floatFromInt(@as(i32, @intCast((i + n) % 7)));
@@ -922,7 +1014,6 @@ test "vector-mode search over an in-memory sqlite-vec index does not crash" {
     defer freeResults(allocator, sr.results);
     try std.testing.expect(sr.results.len >= 1);
 }
-
 
 test "dateInRange: since/until as an inclusive day-range classifier over a set" {
     const ts_jun30 = "2026-06-30T23:59:00.000Z";
@@ -955,7 +1046,6 @@ test "dateInRange: since/until as an inclusive day-range classifier over a set" 
     try std.testing.expect(!dateInRange(null, null, "2026-07-01"));
 }
 
-
 test "filtered search finds a target ranked beyond the FTS candidate limit" {
     // Repro: filters used to run AFTER the top_n*multiplier FTS limit, so a
     // low-bm25 matching row in the target project/date was cut before filtering.
@@ -969,21 +1059,33 @@ test "filtered search finds a target ranked beyond the FTS candidate limit" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         _ = try storage.insertMessage(db, .{
-            .file_path = "noise.jsonl", .line_number = @intCast(i + 1), .role = "user",
-            .content = "html html html html html noise", .timestamp = "2026-01-01T00:00:00Z",
-            .session_id = null, .project_name = "noise", .project_dir = "-x-noise",
+            .file_path = "noise.jsonl",
+            .line_number = @intCast(i + 1),
+            .role = "user",
+            .content = "html html html html html noise",
+            .timestamp = "2026-01-01T00:00:00Z",
+            .session_id = null,
+            .project_name = "noise",
+            .project_dir = "-x-noise",
         });
     }
     // 1 weak-matching target row (lower bm25) in the project/day we filter to.
     _ = try storage.insertMessage(db, .{
-        .file_path = "target.jsonl", .line_number = 1, .role = "user",
-        .content = "a single html mention", .timestamp = "2026-06-01T00:00:00Z",
-        .session_id = null, .project_name = "target", .project_dir = "-x-target",
+        .file_path = "target.jsonl",
+        .line_number = 1,
+        .role = "user",
+        .content = "a single html mention",
+        .timestamp = "2026-06-01T00:00:00Z",
+        .session_id = null,
+        .project_name = "target",
+        .project_dir = "-x-target",
     });
 
     // top_n=3 -> old FTS limit=15 fills with noise, cutting the target.
     const by_project = try search(allocator, db, null, "html", .{
-        .mode = .lexical, .top_n = 3, .project_filter = "target",
+        .mode = .lexical,
+        .top_n = 3,
+        .project_filter = "target",
     });
     defer freeResults(allocator, by_project.results);
     try std.testing.expectEqual(@as(usize, 1), by_project.results.len);
@@ -991,7 +1093,10 @@ test "filtered search finds a target ranked beyond the FTS candidate limit" {
 
     // Same story for a date filter.
     const by_date = try search(allocator, db, null, "html", .{
-        .mode = .lexical, .top_n = 3, .since = "2026-06-01", .until = "2026-06-01",
+        .mode = .lexical,
+        .top_n = 3,
+        .since = "2026-06-01",
+        .until = "2026-06-01",
     });
     defer freeResults(allocator, by_date.results);
     try std.testing.expectEqual(@as(usize, 1), by_date.results.len);
@@ -1014,10 +1119,14 @@ test "hybrid ranks an exact-term match above recent semantically-adjacent noise"
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const rowid = try storage.insertMessage(db, .{
-            .file_path = "noise.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
+            .file_path = "noise.jsonl",
+            .line_number = @intCast(i + 1),
+            .role = "assistant",
             .content = "quarterly zebra migration patterns across the savanna",
-            .timestamp = "2026-07-26T00:00:00Z", .session_id = null,
-            .project_name = "noise", .project_dir = "-x-noise",
+            .timestamp = "2026-07-26T00:00:00Z",
+            .session_id = null,
+            .project_name = "noise",
+            .project_dir = "-x-noise",
         });
         var vec: [1024]f32 = undefined;
         for (&vec) |*e| e.* = 1.0; // identical to the query vector -> distance 0
@@ -1026,10 +1135,14 @@ test "hybrid ranks an exact-term match above recent semantically-adjacent noise"
 
     // 1 old target row: contains BOTH query terms, embedding far from query.
     const target = try storage.insertMessage(db, .{
-        .file_path = "dotfiles.jsonl", .line_number = 1, .role = "assistant",
+        .file_path = "dotfiles.jsonl",
+        .line_number = 1,
+        .role = "assistant",
         .content = "to make the ghostty window start out wider set window-width on startup",
-        .timestamp = "2026-01-01T00:00:00Z", .session_id = null,
-        .project_name = "dotfiles", .project_dir = "-x-dotfiles",
+        .timestamp = "2026-01-01T00:00:00Z",
+        .session_id = null,
+        .project_name = "dotfiles",
+        .project_dir = "-x-dotfiles",
     });
     var tvec: [1024]f32 = undefined;
     for (&tvec) |*e| e.* = 0.0; // far from the all-ones query vector
@@ -1077,16 +1190,26 @@ test "results are deduped to the best message per conversation" {
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         _ = try storage.insertMessage(db, .{
-            .file_path = "conv-a.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
-            .content = "alpha discussion about the alpha topic in depth", .timestamp = null,
-            .session_id = "sess-a", .project_name = "proj", .project_dir = "-x-proj",
+            .file_path = "conv-a.jsonl",
+            .line_number = @intCast(i + 1),
+            .role = "assistant",
+            .content = "alpha discussion about the alpha topic in depth",
+            .timestamp = null,
+            .session_id = "sess-a",
+            .project_name = "proj",
+            .project_dir = "-x-proj",
         });
     }
     // Conversation B: a single matching message.
     _ = try storage.insertMessage(db, .{
-        .file_path = "conv-b.jsonl", .line_number = 1, .role = "assistant",
-        .content = "alpha appears here exactly once", .timestamp = null,
-        .session_id = "sess-b", .project_name = "proj", .project_dir = "-x-proj",
+        .file_path = "conv-b.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "alpha appears here exactly once",
+        .timestamp = null,
+        .session_id = "sess-b",
+        .project_name = "proj",
+        .project_dir = "-x-proj",
     });
 
     const sr = try search(allocator, db, null, "alpha", .{ .mode = .lexical, .top_n = 10 });
@@ -1094,8 +1217,7 @@ test "results are deduped to the best message per conversation" {
 
     // Two conversations -> exactly two results, not six.
     try std.testing.expectEqual(@as(usize, 2), sr.results.len);
-    try std.testing.expect(!std.mem.eql(u8,
-        sr.results[0].message.session_id.?, sr.results[1].message.session_id.?));
+    try std.testing.expect(!std.mem.eql(u8, sr.results[0].message.session_id.?, sr.results[1].message.session_id.?));
 }
 
 test "multi-term lexical search requires all terms, with OR fallback" {
@@ -1109,16 +1231,26 @@ test "multi-term lexical search requires all terms, with OR fallback" {
     defer schema.deinit(allocator);
 
     _ = try storage.insertMessage(db, .{
-        .file_path = "both.jsonl", .line_number = 1, .role = "assistant",
-        .content = "the ghostty window can start out wider", .timestamp = null,
-        .session_id = "s-both", .project_name = "p", .project_dir = "-x-p",
+        .file_path = "both.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "the ghostty window can start out wider",
+        .timestamp = null,
+        .session_id = "s-both",
+        .project_name = "p",
+        .project_dir = "-x-p",
     });
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         _ = try storage.insertMessage(db, .{
-            .file_path = "wonly.jsonl", .line_number = @intCast(i + 1), .role = "assistant",
-            .content = "resize the window to fit the window pane window", .timestamp = null,
-            .session_id = "s-wonly", .project_name = "p", .project_dir = "-x-p",
+            .file_path = "wonly.jsonl",
+            .line_number = @intCast(i + 1),
+            .role = "assistant",
+            .content = "resize the window to fit the window pane window",
+            .timestamp = null,
+            .session_id = "s-wonly",
+            .project_name = "p",
+            .project_dir = "-x-p",
         });
     }
 
@@ -1155,9 +1287,14 @@ test "vector search with a project filter finds a target ranked beyond the KNN l
     var n: usize = 0;
     while (n < 20) : (n += 1) {
         const rid = try storage.insertMessage(db, .{
-            .file_path = "noise.jsonl", .line_number = @intCast(n + 1), .role = "assistant",
-            .content = "near noise", .timestamp = null, .session_id = null,
-            .project_name = "noise", .project_dir = "-x-noise",
+            .file_path = "noise.jsonl",
+            .line_number = @intCast(n + 1),
+            .role = "assistant",
+            .content = "near noise",
+            .timestamp = null,
+            .session_id = null,
+            .project_name = "noise",
+            .project_dir = "-x-noise",
         });
         var v: [1024]f32 = undefined;
         for (&v) |*e| e.* = 1.0;
@@ -1165,9 +1302,14 @@ test "vector search with a project filter finds a target ranked beyond the KNN l
     }
     // 1 FAR target row in the project we filter to (ranked last by distance).
     const tid = try storage.insertMessage(db, .{
-        .file_path = "target.jsonl", .line_number = 1, .role = "assistant",
-        .content = "far target", .timestamp = null, .session_id = null,
-        .project_name = "target", .project_dir = "-x-target",
+        .file_path = "target.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "far target",
+        .timestamp = null,
+        .session_id = null,
+        .project_name = "target",
+        .project_dir = "-x-target",
     });
     var tv: [1024]f32 = undefined;
     for (&tv) |*e| e.* = 0.0;
@@ -1194,7 +1336,9 @@ test "vector search with a project filter finds a target ranked beyond the KNN l
 
     // top_n=1 -> old KNN limit=5 fills with near noise; target (rank ~20) is cut.
     const sr = try search(allocator, db, embedder, "anything", .{
-        .mode = .vector, .top_n = 1, .project_filter = "target",
+        .mode = .vector,
+        .top_n = 1,
+        .project_filter = "target",
     });
     defer freeResults(allocator, sr.results);
     try std.testing.expectEqual(@as(usize, 1), sr.results.len);
@@ -1228,14 +1372,24 @@ test "lexical mode ranks a stronger match above a weaker one" {
     defer schema.deinit(allocator);
 
     _ = try storage.insertMessage(db, .{
-        .file_path = "strong.jsonl", .line_number = 1, .role = "assistant",
-        .content = "widget widget widget widget widget", .timestamp = null,
-        .session_id = "s-strong", .project_name = "p", .project_dir = "-x-p",
+        .file_path = "strong.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "widget widget widget widget widget",
+        .timestamp = null,
+        .session_id = "s-strong",
+        .project_name = "p",
+        .project_dir = "-x-p",
     });
     _ = try storage.insertMessage(db, .{
-        .file_path = "weak.jsonl", .line_number = 1, .role = "assistant",
-        .content = "widget appears just once among many other unrelated words here today", .timestamp = null,
-        .session_id = "s-weak", .project_name = "p", .project_dir = "-x-p",
+        .file_path = "weak.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "widget appears just once among many other unrelated words here today",
+        .timestamp = null,
+        .session_id = "s-weak",
+        .project_name = "p",
+        .project_dir = "-x-p",
     });
 
     const sr = try search(allocator, db, null, "widget", .{ .mode = .lexical, .top_n = 10 });
@@ -1255,18 +1409,28 @@ test "hybrid weights change the ranking: vector-heavy vs lexical-heavy flip the 
     defer schema.deinit(allocator);
 
     const a = try storage.insertMessage(db, .{
-        .file_path = "a.jsonl", .line_number = 1, .role = "assistant",
-        .content = "an unrelated note about zebras and savannas", .timestamp = null,
-        .session_id = "sa", .project_name = "pa", .project_dir = "-x-pa",
+        .file_path = "a.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "an unrelated note about zebras and savannas",
+        .timestamp = null,
+        .session_id = "sa",
+        .project_name = "pa",
+        .project_dir = "-x-pa",
     });
     var av: [1024]f32 = undefined;
     for (&av) |*e| e.* = 1.0; // == query vector -> distance 0
     try storage.insertEmbedding(db, allocator, a, &av);
 
     const b = try storage.insertMessage(db, .{
-        .file_path = "b.jsonl", .line_number = 1, .role = "assistant",
-        .content = "the ghostty window is described right here", .timestamp = null,
-        .session_id = "sb", .project_name = "pb", .project_dir = "-x-pb",
+        .file_path = "b.jsonl",
+        .line_number = 1,
+        .role = "assistant",
+        .content = "the ghostty window is described right here",
+        .timestamp = null,
+        .session_id = "sb",
+        .project_name = "pb",
+        .project_dir = "-x-pb",
     });
     var bv: [1024]f32 = undefined;
     for (&bv) |*e| e.* = 0.0; // far from query vector
@@ -1293,7 +1457,11 @@ test "hybrid weights change the ranking: vector-heavy vs lexical-heavy flip the 
 
     // Vector-heavy: the semantic match (A, "zebras") wins.
     const vecheavy = try search(allocator, db, embedder, "ghostty window", .{
-        .mode = .hybrid, .top_n = 5, .weight_vector = 10.0, .weight_lexical = 0.01, .weight_recency = 0.0,
+        .mode = .hybrid,
+        .top_n = 5,
+        .weight_vector = 10.0,
+        .weight_lexical = 0.01,
+        .weight_recency = 0.0,
     });
     defer freeResults(allocator, vecheavy.results);
     try std.testing.expect(vecheavy.results.len >= 1);
@@ -1301,7 +1469,11 @@ test "hybrid weights change the ranking: vector-heavy vs lexical-heavy flip the 
 
     // Lexical-heavy: the keyword match (B, "ghostty window") wins.
     const lexheavy = try search(allocator, db, embedder, "ghostty window", .{
-        .mode = .hybrid, .top_n = 5, .weight_vector = 0.01, .weight_lexical = 10.0, .weight_recency = 0.0,
+        .mode = .hybrid,
+        .top_n = 5,
+        .weight_vector = 0.01,
+        .weight_lexical = 10.0,
+        .weight_recency = 0.0,
     });
     defer freeResults(allocator, lexheavy.results);
     try std.testing.expect(lexheavy.results.len >= 1);
