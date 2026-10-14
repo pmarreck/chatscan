@@ -1,63 +1,21 @@
-# Plan
+# PLAN
 
-- [x] Implement byte-bounded `recall` and source-verified `expand` for post-compaction evidence, then hand an exact candidate binary and test commands to Einstein for independent review and live acceptance — candidate completed 2026-09-16 18:52 EDT.
-  - [x] Recover current search, output, index-schema, and source-parser contracts; specify stable references, exact project/session scoping, freshness states, and continuation semantics — completed 2026-09-16 18:45 EDT.
-  - [x] TDD the final serialized-byte budget, including JSON escaping, Unicode, minimal-envelope failure, huge single-message continuation, and duplicate-free paging — completed 2026-09-16 18:45 EDT.
-  - [x] TDD raw-source verification and source-schema fidelity for supported Claude, Codex, and Gemini fixtures, including changed, missing, replaced, truncated, and appended sources — completed 2026-09-16 18:45 EDT.
-  - [x] TDD CLI parsing/help/errors, exact session and canonical-project isolation, deterministic lexical recall without an embedding service, chronology, omissions, and honest no-hit output — completed 2026-09-16 18:45 EDT.
-  - [x] Document the implemented contract, run the complete suite/build, commit a known-green candidate, and report it to Einstein through `$HOME/inbox` without embedding transcript content — candidate completed 2026-09-16 18:52 EDT.
-  - Curiosity poke: can every displayed byte be traced to a freshly verified source while a cursor remains stable enough to resume inside an oversized message after benign append-only growth?
-- [ ] Add native Grok Build conversation indexing from `GROK_HOME/sessions`, preserving ACP message roles and incremental identity; queued behind the authorized bounded-recall work from Einstein's 2026-09-02 request.
-  - Curiosity poke: how should duplicate session UUIDs across encoded cwd groups fail deterministically without trusting directory slugs over `summary.json` metadata?
-- [x] Diagnose the live `chatscan rename` stall without interrupting it or risking the partially renamed project, reproduce the blocking phase, and repair it TDD-first — completed 2026-08-05 12:23 EDT.
-  - [x] Record the cross-project Zig 0.16 prompt-reader lesson in shared `~/MEMORIES`; the full memory root validates — completed 2026-08-05 12:17 EDT.
-  - Curiosity poke: did the command block before mutation on confirmation input, during an atomic directory move, while rewriting a log, or inside SQLite locking/work proportional to the full index?
-- [x] Confirm which activity resets the watcher idle timeout: a successful pass that indexes or deletes files; searches and no-op polls do not reset it — completed 2026-08-05 10:56 EDT.
-- [x] Confirm and report the default `chatscan watch` idle timeout: `30m`; `never` disables retirement — completed 2026-08-05 10:54 EDT.
-- [x] Realign `chatscan rename` with current Claude and Codex storage formats, then verify the real rename plan without mutating Peter's project or logs — completed 2026-08-05 11:06 EDT.
-  - [x] Diagnose the false-empty plan: Claude normalizes punctuation to hyphens in conversation-project slugs; Codex already supports its current direct `YYYY/MM/DD` layout and truthfully has no exact-cwd session for this project; the index lookup guesses the obsolete Claude slug.
-  - [x] Keep legacy chat formats out of chatscan's migration logic; when an old format is positively identified, detect it and direct the operator to launch the owning TUI for its background upgrade.
-  - [x] Repair stale-index expiry so missing source logs remove their message, FTS, embedding, and `indexed_files` records without crossing LLM-source boundaries — completed 2026-08-05 11:06 EDT.
-  - Curiosity poke: can current-format discovery remain portable while unsupported legacy layouts are reported without teaching chatscan their particulars?
-- [x] Ported codescan self-suiciding watcher to chatscan (`chatscan watch`) — done 2026-07-29 20:20 EDT. retirement.zig (pure policy) + watch.zig (polling loop, injected clock) + CLI `watch`/--interval/--idle-timeout + config watcher_interval/watcher_idle_timeout + SIGINT/SIGTERM graceful stop. TDD: retirement suite, RetirementTracker mock-clock test, cli parse test, and a bounded CLI e2e proving self-termination.
-- [ ] (future, optional) `ollama pull bge-m3` to restore general-purpose hybrid on the 1024-dim index (no reindex needed). Deferred: evaluating jina-code-embeddings-1.5b first.
-- [ ] Evaluate jina-code-embeddings-1.5b for chatscan on CODE-related queries (its strength). Switched active index to the preserved jina/1536 index; weights are NOT jina-tuned (defaults 1.0/1.0/0.3) — experiment via --weight-vector.
-- [x] Make RRF ranking weights configurable (config keys weight_vector/weight_lexical/weight_recency + --weight-* CLI flags + CHATSCAN_WEIGHT_* env; flag>env>config>default; defaults unchanged 1.0/1.0/0.3) so a weak embedding model can be dialed down instead of dominating. Done 2026-07-28 22:30 EDT. TDD: config parse, cli parse (incl. reject non-numeric), and a search.zig behavioral test proving vector-heavy vs lexical-heavy flips the winner.
-- [ ] Embedding-index backups (housekeeping, removable later): `~/.local/share/chatscan/index.sqlite3.jina-1536.bak` (the jina-code-embeddings-1.5b experiment, 177MB) — kept for now for A/B, safe to delete once bge is confirmed the keeper. bge-m3 (1024-dim) is the ACTIVE index again after jina ranked poorly for conversational recall.
-- [x] Exclude observer/meta noise: configurable ignore-list (default-skips claude-mem observer-sessions; extend via CHATSCAN_IGNORE). Index-time skip + auto-purge of previously-indexed rows via the delete-sweep. Verified on a real-index COPY: observer purged, real convs intact, real index untouched. Done 2026-07-28 13:46 EDT. Files stay on disk (still mineable).
-- [x] Show LLM source (claude/codex/gemini) on each hit via LlmSource.fromPath — [source] tag in human output + JSON source field. Done 2026-07-28 13:32 EDT.
-- [ ] (future / separate) Evaluate mining the 151 claude-mem observer-sessions (Jun28-Jul6, ~1.5M tokens of typed <observation> records) as source material for the memories skill. Needs curation.
-- [x] Fix hybrid search burying exact-term matches under recent-but-irrelevant conversations (the "Ghostty window" complaint): replace the weighted raw-score sum with **Reciprocal Rank Fusion** across vector+lexical+recency rankers; recency demoted to a low-weight tiebreaker; fixed the dedup bug that silently dropped a vector hit's lexical signal. Red test `hybrid ranks an exact-term match above recent semantically-adjacent noise` first, then green; dogfooded on the real index (top-8 went from unrelated `tiffz` to a coherent Ghostty set) — completed 2026-07-27 20:30 EDT.
-  - Curiosity poke: does RRF's tight score-clustering break the ratio-based `score_dropoff` gate?
-- [x] Adversarial code review of the scoring algorithm — completed 2026-07-27 21:16 EDT. Found F1 (one conversation floods 7/10 slots), F2 (`score_dropoff` a no-op under RRF), F3 (vector candidates bypass filter pushdown), F4 (multi-term FTS ORs tokens). Peter chose to fix all four.
-- [x] F1: dedup to best message per conversation — done 2026-07-27 21:20 EDT. Real index: "Ghostty window" top-10 now 10 DISTINCT conversations (was 7 fragments of one).
-- [x] F2: recalibrate `score_dropoff` for RRF — done 2026-07-27 21:47 EDT. Hybrid cuts at a fixed fraction of the theoretical-max fused score (1/rrf_k), top_n-stable; total_relevant converges (~25) instead of growing with --top (was 64+).
-- [x] F3: filtered vector search via scalar-distance full scan (vec_distance_l2) — done 2026-07-27 21:33 EDT.
-- [x] F4: conjunctive (AND) multi-term FTS with OR fallback — done 2026-07-27 21:22 EDT.
-- [x] F7 (found during F2 work): fixed inverted --mode lexical ranking — normalize on bm25 MAGNITUDE (|bm25|/(1+|bm25|)) so stronger matches score higher. Red test confirmed weakest-first, green after. Done 2026-07-27 21:50 EDT.
-- [x] Fix repeated `chatscan index` runs that report configured Ollama model `bge-m3` is loading without initiating or observing a load — completed 2026-07-24 11:11 EDT.
-  - Curiosity poke: does readiness confuse “installed but not resident,” “actively loading,” and “unavailable,” and can its advice actually advance each state?
-- [x] Reconcile the detached commit and `mechatron-ci-integration` into `yolo` without losing the exact staged cleanup — completed 2026-07-24 09:25 EDT (estimated).
-  - Curiosity poke: do hidden `refs/jj/keep/*` contain unique trees that are absent from the reconciled history?
-- [x] Fix the shared memories skill so `.codescan/` search-index internals are ignored by title listing and frontmatter validation (blocks metadata recall) — completed 2026-07-24 09:29 EDT.
-  - Curiosity poke: are other generated hidden directories recursively misclassified even though root-level hidden files are already ignored?
-- [x] Reproduce `chatscan rg` failing because `zig-out/bin/chatscan` requests an unavailable musl loader, then add a persistent regression test and repair the build/install path — completed 2026-07-24 09:39 EDT.
-  - Curiosity poke: can a cross-compiled artifact silently replace the host-native PATH binary after `build_all` or a Nix build?
-- [x] Complete the Mechatron Prime CI integration: exact targets manifest, canonical dynamic README badge, webhook audit/provisioning, push, and live PASSING verification — completed 2026-07-24 09:57 EDT.
-  - [x] Add and locally verify the exact package/check target set and canonical dynamic badge — completed 2026-07-24 09:47 EDT.
-  - [x] Confirm the existing active webhook, push `yolo`, and verify exact commit `590184f` reaches `PASSING` — completed 2026-07-24 09:57 EDT.
-  - Curiosity poke: does the exact pushed SHA expose both selected flake targets, and does the public badge follow that build rather than stale state?
-- [x] Add a failing CI-contract test for a real sandboxed suite — completed 2026-07-10 11:27 EDT (estimated).
-  - Curiosity poke: can a check still pass by printing a success marker without executing Zig?
-- [x] Add `checks.x86_64-linux.test` and make `./test` the full-suite entrypoint — completed 2026-07-10 11:28 EDT (estimated).
-  - Curiosity poke: do pure Nix sandboxes provide script interpreters and ELF loaders at global filesystem paths?
-- [x] Make Linux test executables baseline-portable and runnable in the sandbox — completed 2026-07-10 11:34 EDT (estimated).
-  - Curiosity poke: does the contract prove the exact target/CPU/test arguments and failure propagation?
-- [x] Run the complete sandboxed test suite and independent package build — completed 2026-07-10 11:36 EDT.
-  - Curiosity poke: are the final results reproducible after documentation and metadata enter the flake source?
-- [x] Integrate current `origin/yolo` without losing its ReleaseSafe and CLI suites — completed 2026-07-10 11:58 EDT (estimated).
-  - Curiosity poke: does the sandbox runner continue into CLI tests after a Zig failure, proving group accumulation?
-- [x] Re-run `./test`, `./build`, and `nix flake check` after conflict resolution — completed 2026-07-10 12:13 EDT.
-  - Curiosity poke: does the pure sandbox contain every CLI tool the richer suite needs?
-- [x] Permanently ban native Zig through `nix develop` in top-level entrypoints and route ordinary `./test` through the Nix check — completed 2026-07-10 12:19 EDT (estimated).
-  - Curiosity poke: are `--no-build` and the live-Ollama boundary still described truthfully across the pure/marked-direct split?
+Open work is ordered below. Completed history is in [docs/PLAN_LOG.md](docs/PLAN_LOG.md); stable purpose is in [INTENT.md](INTENT.md).
+
+## Active
+
+- [ ] Add native Grok Build indexing through `--llm grok` and `--all-llms`, preserving authoritative session/project identity and visible ACP roles. (context: [docs/plan_context/grok-indexing.md](docs/plan_context/grok-indexing.md))
+	- [ ] TDD root resolution, summary discovery, canonical metadata, missing-install no-op, and fail-closed duplicate session IDs.
+	- [ ] TDD ACP visible-message reconstruction while excluding reasoning, tools, hooks, plugins, and synthetic records.
+	- [ ] TDD unchanged reruns, append-only updates, incomplete trailing JSONL, and source-scoped stale-record expiry.
+	- [ ] Wire CLI/config/help/docs, run `./test`, commit, push, and verify exact-commit Mechatron Prime CI.
+
+## Deferred
+
+- [ ] Decide whether to retain or Trash local experimental embedding-index backups after the active model choice is settled.
+- [ ] Evaluate observer-session records as possible curated memory source material; keep observer noise excluded from normal search.
+
+## Recent completions
+
+- [x] Added byte-bounded raw-verified `recall` and `expand`, with exact scope, stable references, and duplicate-free continuation. (done 2026-09-16 18:52 EDT; commit `0d27d73`)
+- [x] Repaired current-format rename discovery, stale-index expiry, and nonblocking confirmation input. (done 2026-08-05 12:23 EDT)

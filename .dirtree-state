@@ -2,11 +2,14 @@
 ver=1.2
 annotate=[
 	.mechatron-prime/targets = Declares the exact Nix package and full-suite check built by Mechatron Prime CI.
+	INTENT.md = Canonical project purpose, scope, constraints, and success evidence
 	LEARNINGS.md = Hard-won sqlite-vec UBSan and pure Nix sandbox execution lessons
 	MISTAKES.md = Agent workflow mistakes and corrective lessons
 	PLAN.md = Current checked CI repair plan with completion times and curiosity pokes
 	README.md = Project overview, installation, testing, usage, and configuration documentation
 	build.zig = Build: links sqlite3/sqlite_vec0 and wires aggregated plus per-module unit tests
+	docs/PLAN_LOG.md = Retired completed PLAN items retained for project history
+	docs/plan_context/grok-indexing.md = Approved Grok Build indexing contract and acceptance checks
 	flake.nix = Nix package, dependency cache, dev shell, and sandboxed full-suite CI derivation
 	src/indexer.zig = Incremental conversation indexer with batched embedding generation, resumable missing-vector repair, and progress reporting.
 	src/ollama.zig = Ollama HTTP adapter; verifies installed models and actively warms idle models with a readiness embedding.
