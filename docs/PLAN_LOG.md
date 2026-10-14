@@ -44,3 +44,11 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
   - Curiosity poke: does the pure sandbox contain every CLI tool the richer suite needs?
 - [x] [Plan] Permanently ban native Zig through `nix develop` in top-level entrypoints and route ordinary `./test` through the Nix check — completed 2026-07-10 12:19 EDT (estimated).
   - Curiosity poke: are `--no-build` and the live-Ollama boundary still described truthfully across the pure/marked-direct split?
+- [x] [Active] Add native Grok Build indexing through `--llm grok` and `--all-llms`, preserving authoritative session/project identity and visible ACP roles. (done 2026-10-14 19:20 EDT; commit `1732c6e`; context: [docs/plan_context/grok-indexing.md](docs/plan_context/grok-indexing.md))
+	- [x] TDD root resolution, summary discovery, canonical metadata, missing-install no-op, and fail-closed duplicate session IDs. (done 2026-10-14 16:05 EDT)
+	- [x] TDD ACP visible-message reconstruction while excluding reasoning, tools, hooks, plugins, and synthetic records. (done 2026-10-14 16:05 EDT)
+	- [x] TDD unchanged reruns, append-only updates, incomplete trailing JSONL, and source-scoped stale-record expiry. (done 2026-10-14 16:05 EDT)
+	- [x] Wire CLI/config/help/docs and run the complete `./test` gate. (done 2026-10-14 16:22 EDT)
+	- [x] Commit, push, report the candidate to Einstein, and verify exact-commit Mechatron Prime CI. (done 2026-10-14 19:20 EDT; commit `1732c6e`)
+- [x] [Recent completions] Added byte-bounded raw-verified `recall` and `expand`, with exact scope, stable references, and duplicate-free continuation. (done 2026-09-16 18:52 EDT; commit `0d27d73`)
+- [x] [Recent completions] Repaired current-format rename discovery, stale-index expiry, and nonblocking confirmation input. (done 2026-08-05 12:23 EDT)
