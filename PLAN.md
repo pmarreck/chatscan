@@ -5,10 +5,11 @@ Open work is ordered below. Completed history is in [docs/PLAN_LOG.md](docs/PLAN
 ## Active
 
 - [ ] Add native Grok Build indexing through `--llm grok` and `--all-llms`, preserving authoritative session/project identity and visible ACP roles. (context: [docs/plan_context/grok-indexing.md](docs/plan_context/grok-indexing.md))
-	- [ ] TDD root resolution, summary discovery, canonical metadata, missing-install no-op, and fail-closed duplicate session IDs.
-	- [ ] TDD ACP visible-message reconstruction while excluding reasoning, tools, hooks, plugins, and synthetic records.
-	- [ ] TDD unchanged reruns, append-only updates, incomplete trailing JSONL, and source-scoped stale-record expiry.
-	- [ ] Wire CLI/config/help/docs, run `./test`, commit, push, and verify exact-commit Mechatron Prime CI.
+	- [x] TDD root resolution, summary discovery, canonical metadata, missing-install no-op, and fail-closed duplicate session IDs. (done 2026-10-14 16:05 EDT)
+	- [x] TDD ACP visible-message reconstruction while excluding reasoning, tools, hooks, plugins, and synthetic records. (done 2026-10-14 16:05 EDT)
+	- [x] TDD unchanged reruns, append-only updates, incomplete trailing JSONL, and source-scoped stale-record expiry. (done 2026-10-14 16:05 EDT)
+	- [x] Wire CLI/config/help/docs and run the complete `./test` gate. (done 2026-10-14 16:22 EDT)
+	- [ ] Commit, push, report the candidate to Einstein, and verify exact-commit Mechatron Prime CI.
 
 ## Deferred
 

@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
         "src/config.zig",
         "src/storage.zig",
         "src/conversation.zig",
+        "src/grok.zig",
         "src/indexer.zig",
         "src/search.zig",
         "src/recall.zig",

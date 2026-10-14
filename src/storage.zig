@@ -350,6 +350,18 @@ pub fn deleteMessagesByFile(db: Db, file_path: []const u8) !void {
     }
 }
 
+pub fn beginTransaction(db: Db) !void {
+    try exec(db, "BEGIN IMMEDIATE");
+}
+
+pub fn commitTransaction(db: Db) !void {
+    try exec(db, "COMMIT");
+}
+
+pub fn rollbackTransaction(db: Db) void {
+    exec(db, "ROLLBACK") catch {};
+}
+
 pub fn resetIndex(db: Db) !void {
     exec(db, "DELETE FROM messages") catch {};
     exec(db, "DELETE FROM messages_fts") catch {};

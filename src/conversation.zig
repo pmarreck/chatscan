@@ -336,6 +336,7 @@ pub fn findConversationFilesForLlm(allocator: std.mem.Allocator, conversation_di
         .claude => findConversationFiles(allocator, conversation_dir),
         .codex => findCodexFiles(allocator, conversation_dir),
         .gemini => findGeminiFiles(allocator, conversation_dir),
+        .grok => unreachable, // Grok discovery is session-metadata based in grok.zig.
         .all => unreachable, // caller handles .all by iterating sources
     };
 }

@@ -4,6 +4,7 @@ const conversation = @import("conversation.zig");
 const embedding = @import("embedding.zig");
 const config = @import("config.zig");
 const runtime = @import("runtime.zig");
+const grok = @import("grok.zig");
 
 pub const IndexStats = struct {
     files_scanned: usize = 0,
@@ -36,6 +37,10 @@ pub fn indexAllForLlm(
     force: bool,
     stderr: *std.Io.Writer,
 ) !IndexStats {
+    if (llm == .grok) {
+        return indexGrokSessions(allocator, db, conversation_dir, embedder, batch_size, force, stderr);
+    }
+
     var stats = IndexStats{};
 
     // Find all conversation files
@@ -191,7 +196,7 @@ pub fn indexAllForLlm(
                 var msg = (switch (llm) {
                     .claude => conversation.parseLine(allocator, line, line_number, project_dir),
                     .codex => conversation.parseCodexLine(allocator, line, line_number, project_dir),
-                    else => unreachable,
+                    .gemini, .grok, .all => unreachable,
                 }) catch continue orelse continue;
 
                 // Insert into storage
@@ -276,6 +281,182 @@ pub fn indexAllForLlm(
     _ = stderr.flush() catch {};
 
     return stats;
+}
+
+fn indexGrokSessions(
+    allocator: std.mem.Allocator,
+    db: storage.Db,
+    sessions_root: []const u8,
+    embedder: ?embedding.Embedder,
+    batch_size: usize,
+    force: bool,
+    stderr: *std.Io.Writer,
+) !IndexStats {
+    var stats = IndexStats{};
+    const sessions = try grok.findSessions(allocator, sessions_root);
+    defer {
+        for (sessions) |*session| session.deinit(allocator);
+        allocator.free(sessions);
+    }
+    stats.files_scanned = sessions.len;
+
+    if (grok.findDuplicateSession(sessions)) |duplicate| {
+        _ = stderr.print(
+            "error: duplicate Grok session id '{s}' in:\n  {s}\n  {s}\n",
+            .{ duplicate.id, duplicate.first_summary_path, duplicate.second_summary_path },
+        ) catch {};
+        _ = stderr.flush() catch {};
+        return error.DuplicateGrokSessionId;
+    }
+
+    const indexed = try storage.getAllIndexedFiles(db, allocator);
+    defer {
+        for (indexed) |*item| item.deinit(allocator);
+        allocator.free(indexed);
+    }
+    var indexed_map = std.StringHashMap(storage.IndexedFile).init(allocator);
+    defer indexed_map.deinit();
+    for (indexed) |item| try indexed_map.put(item.file_path, item);
+
+    var on_disk = std.StringHashMap(void).init(allocator);
+    defer on_disk.deinit();
+
+    if (embedder) |active_embedder| {
+        const backfill = try backfillMissingEmbeddings(allocator, db, active_embedder, batch_size, stderr);
+        stats.embeddings_backfilled = backfill.indexed;
+        stats.embedding_failures += backfill.failed;
+    }
+
+    if (sessions.len == 0) {
+        _ = stderr.print("No Grok sessions found in {s}\n", .{sessions_root}) catch {};
+    } else {
+        _ = stderr.print("Scanning {d} grok conversation files...\n", .{sessions.len}) catch {};
+    }
+    _ = stderr.flush() catch {};
+
+    for (sessions) |session| {
+        const file = std.Io.Dir.cwd().openFile(runtime.io(), session.updates_path, .{}) catch continue;
+        defer file.close(runtime.io());
+        const stat = file.stat(runtime.io()) catch continue;
+        try on_disk.put(session.updates_path, {});
+        const checkpoint = grokFileCheckpoint(stat, session.id, session.cwd);
+
+        const prior = indexed_map.get(session.updates_path);
+        if (!force) {
+            if (prior) |info| {
+                if (info.mtime_ns == checkpoint) continue;
+            }
+        }
+
+        const content = readFile(allocator, session.updates_path) catch continue;
+        defer allocator.free(content);
+        const last_complete_line = grok.lastCompleteRecordLine(allocator, content);
+        if (!force) {
+            if (prior) |info| {
+                if (last_complete_line < info.last_line) {
+                    _ = stderr.print(
+                        "warning: Grok source appears truncated; preserving indexed rows for {s}\n",
+                        .{session.updates_path},
+                    ) catch {};
+                    continue;
+                }
+            }
+        }
+
+        const messages = try grok.parseUpdates(allocator, content, session.id, session.cwd);
+        defer {
+            for (messages) |*message| message.deinit(allocator);
+            allocator.free(messages);
+        }
+
+        var embed_texts = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (embed_texts.items) |text| allocator.free(text);
+            embed_texts.deinit(allocator);
+        }
+        var embed_rowids = std.ArrayListUnmanaged(i64).empty;
+        defer embed_rowids.deinit(allocator);
+
+        try storage.beginTransaction(db);
+        var committed = false;
+        defer if (!committed) storage.rollbackTransaction(db);
+        try storage.deleteMessagesByFile(db, session.updates_path);
+        for (messages) |message| {
+            const rowid = try storage.insertMessage(db, .{
+                .file_path = session.updates_path,
+                .line_number = message.line_number,
+                .role = message.role,
+                .content = message.content,
+                .timestamp = message.timestamp,
+                .session_id = message.session_id,
+                .project_name = message.project_name,
+                .project_dir = message.project_dir,
+            });
+            if (embedder != null) {
+                const text = message.content[0..@min(message.content.len, 1600)];
+                try embed_texts.append(allocator, try allocator.dupe(u8, text));
+                try embed_rowids.append(allocator, rowid);
+                if (embed_texts.items.len >= @max(batch_size, 1)) {
+                    stats.embedding_failures += try flushEmbeddingBatch(
+                        allocator,
+                        db,
+                        embedder.?,
+                        &embed_texts,
+                        &embed_rowids,
+                    );
+                }
+            }
+        }
+        if (embedder != null and embed_texts.items.len > 0) {
+            stats.embedding_failures += try flushEmbeddingBatch(
+                allocator,
+                db,
+                embedder.?,
+                &embed_texts,
+                &embed_rowids,
+            );
+        }
+        try storage.upsertIndexedFile(db, session.updates_path, checkpoint, last_complete_line);
+        try storage.commitTransaction(db);
+        committed = true;
+
+        if (messages.len > 0) {
+            stats.files_indexed += 1;
+            stats.messages_indexed += messages.len;
+        }
+    }
+
+    for (indexed) |item| {
+        if (pathIsWithinRoot(item.file_path, sessions_root) and !on_disk.contains(item.file_path)) {
+            try storage.beginTransaction(db);
+            var committed = false;
+            defer if (!committed) storage.rollbackTransaction(db);
+            try storage.deleteMessagesByFile(db, item.file_path);
+            try storage.deleteIndexedFile(db, item.file_path);
+            try storage.commitTransaction(db);
+            committed = true;
+            stats.files_deleted += 1;
+        }
+    }
+
+    _ = stderr.print("Done: {d} files indexed, {d} messages, {d} files removed\n", .{
+        stats.files_indexed,
+        stats.messages_indexed,
+        stats.files_deleted,
+    }) catch {};
+    _ = stderr.flush() catch {};
+    return stats;
+}
+
+fn grokFileCheckpoint(stat: std.Io.File.Stat, session_id: []const u8, cwd: []const u8) i64 {
+    const modified: i64 = @intCast(stat.mtime.nanoseconds);
+    const size: i64 = @intCast(stat.size);
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(std.mem.asBytes(&modified));
+    hash.update(std.mem.asBytes(&size));
+    hash.update(session_id);
+    hash.update(cwd);
+    return @bitCast(hash.final());
 }
 
 /// Classify a stored file under one source root without matching sibling prefixes.
@@ -833,9 +1014,14 @@ test "indexAll purges a previously-indexed observer file (existing index cleanup
 
     // Simulate a pre-ignore index entry for the observer file.
     _ = try storage.insertMessage(db, .{
-        .file_path = obs_file, .line_number = 1, .role = "user",
-        .content = "obs xml here", .timestamp = null, .session_id = "o1",
-        .project_name = "obs", .project_dir = "-home-x--claude-mem-observer-sessions",
+        .file_path = obs_file,
+        .line_number = 1,
+        .role = "user",
+        .content = "obs xml here",
+        .timestamp = null,
+        .session_id = "o1",
+        .project_name = "obs",
+        .project_dir = "-home-x--claude-mem-observer-sessions",
     });
     try storage.upsertIndexedFile(db, obs_file, 111, 1);
     {
@@ -853,4 +1039,134 @@ test "indexAll purges a previously-indexed observer file (existing index cleanup
     var maybe = try storage.getIndexedFile(db, allocator, obs_file);
     if (maybe) |*m| m.deinit(allocator);
     try std.testing.expect(maybe == null);
+}
+
+fn writeGrokIndexFixture(path: []const u8, content: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    try std.Io.Dir.cwd().createDirPath(runtime.io(), parent);
+    const file = try std.Io.Dir.cwd().createFile(runtime.io(), path, .{});
+    defer file.close(runtime.io());
+    try file.writeStreamingAll(runtime.io(), content);
+}
+
+test "Grok indexing is idempotent, appends once, and preserves rows across truncation" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+    var namespace: u8 = 0;
+    const root = try std.fmt.allocPrint(allocator, "{s}/chatscan-grok-index-{x}", .{ tmpdir, @intFromPtr(&namespace) });
+    defer allocator.free(root);
+    std.Io.Dir.cwd().deleteTree(runtime.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), root) catch {};
+
+    const summary_path = try std.fmt.allocPrint(allocator, "{s}/group-a/session-a/summary.json", .{root});
+    defer allocator.free(summary_path);
+    const updates_path = try std.fmt.allocPrint(allocator, "{s}/group-a/session-a/updates.jsonl", .{root});
+    defer allocator.free(updates_path);
+    try writeGrokIndexFixture(summary_path, "{\"info\":{\"id\":\"session-a\",\"cwd\":\"/workspace/alpha\"}}\n");
+    const initial_updates =
+        \\{"method":"session/update","timestamp":"2026-09-02T12:00:00Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"First"}}}}
+        \\{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"noise"}}}}
+        \\{"method":"session/update","timestamp":"2026-09-02T12:00:01Z","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Answer"}}}}
+        \\
+    ;
+    try writeGrokIndexFixture(updates_path, initial_updates);
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+
+    const first = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(usize, 1), first.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), first.files_indexed);
+    try std.testing.expectEqual(@as(usize, 2), first.messages_indexed);
+    try std.testing.expectEqual(@as(i64, 2), storage.getMessageCount(db));
+
+    const unchanged = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.files_indexed);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.messages_indexed);
+    try std.testing.expectEqual(@as(i64, 2), storage.getMessageCount(db));
+
+    try writeGrokIndexFixture(summary_path, "{\"info\":{\"id\":\"session-a\",\"cwd\":\"/workspace/renamed\"}}\n");
+    const metadata_changed = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(usize, 1), metadata_changed.files_indexed);
+    var renamed = try storage.getMessageAt(db, allocator, updates_path, 1);
+    defer if (renamed) |*message| message.deinit(allocator);
+    try std.testing.expect(renamed != null);
+    try std.testing.expectEqualStrings("/workspace/renamed", renamed.?.project_dir.?);
+
+    const appended_updates = initial_updates ++
+        \\{"method":"session/update","timestamp":"2026-09-02T12:00:02Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Later"}}}}
+        \\
+    ;
+    try writeGrokIndexFixture(updates_path, appended_updates);
+    _ = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(i64, 3), storage.getMessageCount(db));
+    var appended = try storage.getMessageAt(db, allocator, updates_path, 4);
+    defer if (appended) |*message| message.deinit(allocator);
+    try std.testing.expect(appended != null);
+    try std.testing.expectEqualStrings("Later", appended.?.content);
+
+    const truncated =
+        \\{"method":"session/update","timestamp":"2026-09-02T12:00:00Z","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"First"}}}}
+        \\{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unfinished"}}}
+    ;
+    try writeGrokIndexFixture(updates_path, truncated);
+    _ = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(i64, 3), storage.getMessageCount(db));
+
+    _ = try storage.insertMessage(db, .{
+        .file_path = "/outside/sentinel.jsonl",
+        .line_number = 1,
+        .role = "user",
+        .content = "outside root",
+    });
+    try std.Io.Dir.cwd().deleteFile(runtime.io(), updates_path);
+    const removed = try indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output);
+    try std.testing.expectEqual(@as(usize, 1), removed.files_deleted);
+    try std.testing.expectEqual(@as(i64, 1), storage.getMessageCount(db));
+}
+
+test "duplicate Grok identities fail before writes with ordered diagnostics" {
+    const allocator = std.testing.allocator;
+    const tmpdir = runtime.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmpdir);
+    var namespace: u8 = 0;
+    const root = try std.fmt.allocPrint(allocator, "{s}/chatscan-grok-index-duplicate-{x}", .{ tmpdir, @intFromPtr(&namespace) });
+    defer allocator.free(root);
+    std.Io.Dir.cwd().deleteTree(runtime.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(runtime.io(), root) catch {};
+
+    const a_summary = try std.fmt.allocPrint(allocator, "{s}/a-group/shared/summary.json", .{root});
+    defer allocator.free(a_summary);
+    const z_summary = try std.fmt.allocPrint(allocator, "{s}/z-group/shared/summary.json", .{root});
+    defer allocator.free(z_summary);
+    try writeGrokIndexFixture(a_summary, "{\"info\":{\"id\":\"shared\",\"cwd\":\"/workspace/a\"}}\n");
+    try writeGrokIndexFixture(z_summary, "{\"info\":{\"id\":\"shared\",\"cwd\":\"/workspace/z\"}}\n");
+
+    const db = try storage.openMemoryWithVec(allocator);
+    defer storage.close(db);
+    var schema = try storage.initSchema(allocator, db, .{ .embedding_dim = 1024 });
+    defer schema.deinit(allocator);
+    _ = try storage.insertMessage(db, .{
+        .file_path = "/outside/sentinel.jsonl",
+        .line_number = 1,
+        .role = "user",
+        .content = "sentinel",
+    });
+
+    var output_buffer: [4096]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    try std.testing.expectError(
+        error.DuplicateGrokSessionId,
+        indexAllForLlm(allocator, db, root, .grok, null, 16, false, &output),
+    );
+    try std.testing.expectEqual(@as(i64, 1), storage.getMessageCount(db));
+    const diagnostic = output.buffered();
+    const a_position = std.mem.indexOf(u8, diagnostic, "/a-group/shared/summary.json").?;
+    const z_position = std.mem.indexOf(u8, diagnostic, "/z-group/shared/summary.json").?;
+    try std.testing.expect(a_position < z_position);
 }

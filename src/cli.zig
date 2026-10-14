@@ -599,6 +599,14 @@ test "parse index command" {
     try std.testing.expect(parsed.reindex);
 }
 
+test "parse Grok source selector" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "chatscan", "index", "--llm", "grok" };
+    var parsed = try parse(allocator, &args);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(config.LlmSource.grok, parsed.llm_source.?);
+}
+
 test "parse regex flag" {
     const allocator = std.testing.allocator;
     const args = [_][]const u8{ "chatscan", "--regex", "indexOfIgnoreCase" };

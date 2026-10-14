@@ -39,6 +39,26 @@ pub const IndexedClaim = struct {
     project_dir: ?[]const u8 = null,
 };
 
+pub fn supportsRawVerification(source: config.LlmSource) bool {
+    return switch (source) {
+        .claude, .codex, .gemini => true,
+        .grok, .all => false,
+    };
+}
+
+test "raw verification support classifies every LLM source" {
+    const cases = [_]struct { source: config.LlmSource, expected: bool }{
+        .{ .source = .claude, .expected = true },
+        .{ .source = .codex, .expected = true },
+        .{ .source = .gemini, .expected = true },
+        .{ .source = .grok, .expected = false },
+        .{ .source = .all, .expected = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, supportsRawVerification(case.source));
+    }
+}
+
 pub const RawVerification = struct {
     message: conversation.ParsedMessage,
     canonical_project: ?[]u8,
@@ -127,7 +147,7 @@ pub fn verifyReference(
         parsed_message = (switch (decoded.source) {
             .claude => conversation.parseLine(allocator, located.line, decoded.line_number, ""),
             .codex => conversation.parseCodexLine(allocator, located.line, decoded.line_number, ""),
-            .gemini, .all => unreachable,
+            .gemini, .grok, .all => unreachable,
         } catch return error.ReferenceInvalidated) orelse return error.ReferenceInvalidated;
     }
     errdefer parsed_message.deinit(allocator);
@@ -305,7 +325,7 @@ fn parseSourceMessages(allocator: std.mem.Allocator, bytes: []const u8, source: 
             var parsed = (switch (source) {
                 .claude => conversation.parseLine(allocator, bytes[start..end], line_number, ""),
                 .codex => conversation.parseCodexLine(allocator, bytes[start..end], line_number, ""),
-                .gemini, .all => unreachable,
+                .gemini, .grok, .all => unreachable,
             } catch null);
             if (parsed) |*message| {
                 try output.append(allocator, .{
@@ -638,7 +658,7 @@ pub fn verifyIndexedClaim(
         parsed_message = (switch (source) {
             .claude => conversation.parseLine(allocator, located.line, claim.line_number, claim.project_dir orelse ""),
             .codex => conversation.parseCodexLine(allocator, located.line, claim.line_number, claim.project_dir orelse ""),
-            .gemini, .all => unreachable,
+            .gemini, .grok, .all => unreachable,
         } catch return error.SourceChanged) orelse return error.SourceChanged;
     }
     errdefer parsed_message.deinit(allocator);

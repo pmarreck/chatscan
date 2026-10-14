@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (parsed.command == .about) {
-        try stdout.print("chatscan {s} — search Claude Code conversation history ({s}-{s})\n", .{
+        try stdout.print("chatscan {s} — search AI coding conversation history ({s}-{s})\n", .{
             version,
             @tagName(@import("builtin").target.os.tag),
             @tagName(@import("builtin").target.cpu.arch),
@@ -223,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
 
             // Index extra LLM sources (--all-llms)
             for (settings.extra_dirs) |ed| {
-                const extra_stats = indexer.indexAllForLlm(
+                const extra_stats = try indexer.indexAllForLlm(
                     allocator,
                     db,
                     ed.dir,
@@ -232,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
                     settings.batch_size,
                     settings.reindex,
                     stderr,
-                ) catch continue;
+                );
                 total_files += extra_stats.files_indexed;
                 total_messages += extra_stats.messages_indexed;
                 total_deleted += extra_stats.files_deleted;
@@ -519,6 +519,10 @@ fn handleRecall(
     var omitted_unverifiable: usize = 0;
     for (sr.results, 0..) |result, index| {
         const source = config.LlmSource.fromPath(result.message.file_path);
+        if (!recall.supportsRawVerification(source)) {
+            omitted_unverifiable += 1;
+            continue;
+        }
         var verification = recall.verifyIndexedClaim(allocator, runtime.io(), .{
             .file_path = result.message.file_path,
             .line_number = result.message.line_number,
@@ -704,8 +708,8 @@ fn resolveSettings(allocator: std.mem.Allocator, parsed: cli.Parsed, cfg: config
     // For --all-llms, build extra dirs for the other LLM sources
     var extra_dirs = std.ArrayListUnmanaged(Settings.ExtraDir).empty;
     if (llm_source == .all) {
-        const other_sources = [_]config.LlmSource{ .codex, .gemini };
-        for (other_sources) |src| {
+        for (config.indexable_sources) |src| {
+            if (src == .claude) continue;
             const dir = config.defaultConversationDirForLlm(allocator, src) catch continue;
             std.Io.Dir.cwd().access(runtime.io(), dir, .{}) catch {
                 allocator.free(dir);
@@ -1101,9 +1105,10 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\                                (flag > CHATSCAN_WEIGHT_* env > config > default)
         \\
         \\LLM source options:
-        \\  --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)
+        \\  --llm <claude|codex|gemini|grok>
+        \\                                Select LLM source (default: auto-detect)
         \\  --all-llms                    Search across all available LLM sources
-        \\  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|all)
+        \\  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|grok|all)
         \\
         \\Index options:
         \\  --reindex                     Force full re-index
@@ -1129,13 +1134,17 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\
         \\Config file: $XDG_CONFIG_HOME/chatscan/config
         \\Database: $XDG_DATA_HOME/chatscan/index.sqlite3
-        \\Sources: ~/.claude/projects/, ~/.codex/sessions/, ~/.gemini/tmp/
+        \\Sources: ~/.claude/projects/, ~/.codex/sessions/, ~/.gemini/tmp/,
+        \\         $GROK_HOME/sessions/ or ~/.grok/sessions/
         \\
     );
 }
 
-test "printUsage does not crash" {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(runtime.io(), &buf);
-    try printUsage(&w.interface);
+test "printUsage advertises Grok source selection and storage" {
+    var buffer: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try printUsage(&writer);
+    const usage = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, usage, "claude|codex|gemini|grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "~/.grok/sessions/") != null);
 }

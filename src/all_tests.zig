@@ -3,6 +3,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("storage.zig");
     _ = @import("conversation.zig");
+    _ = @import("grok.zig");
     _ = @import("indexer.zig");
     _ = @import("retirement.zig");
     _ = @import("watch.zig");

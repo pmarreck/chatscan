@@ -6,12 +6,12 @@
 
 Search your AI coding conversation history with semantic + lexical + recency search.
 
-Supports **Claude Code**, **Codex**, and **Gemini CLI** conversations. Indexes them into SQLite (with FTS5 + optional vector embeddings via **Ollama** or any **OpenAI-compatible** server like **oMLX**) and provides fast hybrid search with recency weighting.
+Supports **Claude Code**, **Codex**, **Gemini CLI**, and **Grok Build** conversations. Indexes them into SQLite (with FTS5 + optional vector embeddings via **Ollama** or any **OpenAI-compatible** server like **oMLX**) and provides fast hybrid search with recency weighting.
 
 ## Quick start
 
 ```bash
-# Index your conversations (auto-detects Claude, Codex, or Gemini)
+# Index your conversations (auto-detects Claude, Codex, Gemini, or Grok)
 chatscan index
 
 # Search (scoped to current project by default)
@@ -35,16 +35,16 @@ chatscan recall "why was this changed" --project-exact "$PWD" --max-bytes 12000
 
 ## Features
 
-- **Multi-LLM support** — indexes Claude (`~/.claude/projects/`), Codex (`~/.codex/sessions/`), and Gemini (`~/.gemini/tmp/`) conversations
+- **Multi-LLM support** — indexes Claude (`~/.claude/projects/`), Codex (`~/.codex/sessions/`), Gemini (`~/.gemini/tmp/`), and Grok (`$GROK_HOME/sessions/` or `~/.grok/sessions/`) conversations
 - **Hybrid search** — semantic (vector), lexical (FTS5), and recency signals fused by **Reciprocal Rank Fusion** (RRF), which ranks by rank-position rather than combining incomparable raw scores, so a strong match in any one signal reliably surfaces
 - **Recency as a gentle tiebreaker** — recent conversations get a mild boost (a low-weight RRF ranker), not enough to bury an exact-term match under recent-but-irrelevant chatter
 - **Sandwich display** — matched message shown bold, with previous/next messages dimmed for context
 - **Auto-scoping (with escape hatches)** — searches are scoped to the current directory's project by default, and say so on stderr; use `--all` to search everything or `--project <name-or-partial-path>` to target another project
 - **Env-var overrides** — `CHATSCAN_DB` and `CHATSCAN_CONVERSATION_DIR` (plus `CHATSCAN_LLM`) override paths without flags; CLI flags override env vars override config
-- **LLM source tag** — every hit is labelled with its origin CLI (`[claude]`/`[codex]`/`[gemini]`), derived from the conversation path; also in `--json` as `source`
+- **LLM source tag** — every hit is labeled with its origin CLI (`[claude]`/`[codex]`/`[gemini]`/`[grok]`), derived from the conversation path; also in `--json` as `source`
 - **Noise exclusion** — indexing skips tool/meta conversation dirs (default: claude-mem observer sessions); extend with `CHATSCAN_IGNORE=<colon:separated:path:fragments>`
 - **Self-suiciding watcher** — `chatscan watch` keeps the index fresh (incremental re-index on a poll interval) and stands down on its own after a configurable idle timeout (`--idle-timeout 30m`, or `never`), so watchers started by a session hook never pile up
-- **Incremental indexing** — only re-indexes changed files based on mtime; every pass also expires message, FTS, embedding, and file-metadata rows for missing or ignored logs inside the selected LLM source root
+- **Incremental indexing** — only re-indexes changed sources; every pass also expires message, FTS, embedding, and file-metadata rows for missing or ignored logs inside the selected LLM source root
 - **Project rename** — rename a project directory and update all conversation logs in one command
 - **Regex fallback** — `--regex` shells out to ripgrep against raw JSONL files
 - **Pluggable embedding backends** — Ollama (default) or any OpenAI-compatible server (oMLX, LM Studio, vLLM, etc.)
@@ -152,9 +152,10 @@ Expand options:
   --cursor <token>              Continue the same window without duplicates
 
 LLM source options:
-  --llm <claude|codex|gemini>   Select LLM source (default: auto-detect)
+  --llm <claude|codex|gemini|grok>
+                                Select LLM source (default: auto-detect)
   --all-llms                    Search across all available LLM sources
-  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|all)
+  CHATSCAN_LLM=<value>          Env var alternative (claude|codex|gemini|grok|all)
 
 Index options:
   --reindex                     Force full re-index
@@ -236,8 +237,12 @@ user records and finalized assistant records. Codex contributes
 `event_msg.user_message` and `event_msg.agent_message`; parallel
 `response_item.message` records, reasoning, tools, compaction records, and
 notifications are ignored. Gemini contributes `user` and `gemini` entries from
-the session's messages array. Chatscan exposes chronology and freshness but
-does not infer which matching decision is final.
+the session's messages array. Grok indexing reconstructs visible
+`user_message_chunk` and `agent_message_chunk` ACP updates while excluding
+thoughts, tools, hooks, plugins, and hidden scrollback. Grok hits are currently
+reported as unverifiable by `recall`; chunk-aware raw references need a separate
+prefix-identity contract. Chatscan exposes chronology and freshness but does
+not infer which matching decision is final.
 
 ### Environment overrides
 
@@ -260,6 +265,7 @@ chatscan auto-detects which LLM sources are available on your system:
 | Claude Code | `~/.claude/projects/` | JSONL per session |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/` | JSONL with event_msg wrappers |
 | Gemini CLI | `~/.gemini/tmp/*/chats/` | JSON with messages array |
+| Grok Build | `$GROK_HOME/sessions/` or `~/.grok/sessions/` | Session `summary.json` plus authoritative ACP `updates.jsonl` |
 
 ```bash
 # Index only Codex conversations
@@ -267,6 +273,9 @@ chatscan --llm codex index
 
 # Search only Gemini conversations
 chatscan --llm gemini "build system"
+
+# Index only Grok Build conversations
+chatscan --llm grok index
 
 # Index and search across all LLMs
 chatscan --all-llms index

@@ -11,6 +11,7 @@ annotate=[
 	docs/PLAN_LOG.md = Retired completed PLAN items retained for project history
 	docs/plan_context/grok-indexing.md = Approved Grok Build indexing contract and acceptance checks
 	flake.nix = Nix package, dependency cache, dev shell, and sandboxed full-suite CI derivation
+	src/grok.zig = Grok Build session discovery and visible ACP message reconstruction
 	src/indexer.zig = Incremental conversation indexer with batched embedding generation, resumable missing-vector repair, and progress reporting.
 	src/ollama.zig = Ollama HTTP adapter; verifies installed models and actively warms idle models with a readiness embedding.
 	src/recall.zig = Byte-bounded raw transcript verification, references, excerpts, and duplicate-free expansion cursors

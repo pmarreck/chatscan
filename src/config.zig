@@ -19,21 +19,28 @@ pub const LlmSource = enum {
     claude,
     codex,
     gemini,
+    grok,
     all,
 
     pub fn parse(value: []const u8) !LlmSource {
         if (std.mem.eql(u8, value, "claude")) return .claude;
         if (std.mem.eql(u8, value, "codex")) return .codex;
         if (std.mem.eql(u8, value, "gemini")) return .gemini;
+        if (std.mem.eql(u8, value, "grok")) return .grok;
         if (std.mem.eql(u8, value, "all")) return .all;
         return error.InvalidLlmSource;
     }
 
     /// Infer the origin CLI from a conversation file path (provenance for
     /// display). Claude lives under `.claude/projects`, Codex under
-    /// `.codex/sessions`, Gemini under `.gemini/tmp`; unknown paths default to
-    /// claude (the historical single source).
+    /// `.codex/sessions`, Gemini under `.gemini/tmp`, and Grok as a
+    /// `sessions/.../updates.jsonl` source; unknown paths default to Claude.
     pub fn fromPath(file_path: []const u8) LlmSource {
+        const grok_posix = std.mem.indexOf(u8, file_path, "/sessions/") != null and
+            std.mem.endsWith(u8, file_path, "/updates.jsonl");
+        const grok_windows = std.mem.indexOf(u8, file_path, "\\sessions\\") != null and
+            std.mem.endsWith(u8, file_path, "\\updates.jsonl");
+        if (grok_posix or grok_windows) return .grok;
         if (std.mem.indexOf(u8, file_path, "/.codex/") != null) return .codex;
         if (std.mem.indexOf(u8, file_path, "/.gemini/") != null) return .gemini;
         return .claude;
@@ -45,10 +52,13 @@ pub const LlmSource = enum {
             .claude => "claude",
             .codex => "codex",
             .gemini => "gemini",
+            .grok => "grok",
             .all => "all",
         };
     }
 };
+
+pub const indexable_sources = [_]LlmSource{ .claude, .codex, .gemini, .grok };
 
 /// Conversation-path fragments that indexing skips by default. The claude-mem
 /// "observer" sessions are a secondary agent's XML commentary on real sessions,
@@ -126,20 +136,27 @@ pub fn defaultConversationDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn defaultConversationDirForLlm(allocator: std.mem.Allocator, llm: LlmSource) ![]u8 {
+    if (llm == .grok) {
+        if (runtime.getEnvVarOwned(allocator, "GROK_HOME")) |grok_home| {
+            defer allocator.free(grok_home);
+            return std.fmt.allocPrint(allocator, "{s}/sessions", .{grok_home});
+        } else |_| {}
+    }
+
     const home = try getHome(allocator);
     defer allocator.free(home);
     return switch (llm) {
         .claude => std.fmt.allocPrint(allocator, "{s}/.claude/projects", .{home}),
         .codex => std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home}),
         .gemini => std.fmt.allocPrint(allocator, "{s}/.gemini/tmp", .{home}),
+        .grok => std.fmt.allocPrint(allocator, "{s}/.grok/sessions", .{home}),
         .all => std.fmt.allocPrint(allocator, "{s}/.claude/projects", .{home}),
     };
 }
 
 /// Detect which LLM sources exist on the system, returning the first available.
 pub fn detectDefaultLlm(allocator: std.mem.Allocator) !LlmSource {
-    const sources = [_]LlmSource{ .claude, .codex, .gemini };
-    for (sources) |llm| {
+    for (indexable_sources) |llm| {
         const dir = try defaultConversationDirForLlm(allocator, llm);
         defer allocator.free(dir);
         std.Io.Dir.cwd().access(runtime.io(), dir, .{}) catch continue;
@@ -301,6 +318,31 @@ test "defaultConversationDir returns expected path" {
     try std.testing.expect(std.mem.endsWith(u8, dir, "/.claude/projects"));
 }
 
+test "Grok source resolution honors GROK_HOME and round-trips the source label" {
+    const allocator = std.testing.allocator;
+    testSetEnv("GROK_HOME", "/synthetic/grok-root");
+    defer testUnsetEnv("GROK_HOME");
+
+    const dir = try defaultConversationDirForLlm(allocator, .grok);
+    defer allocator.free(dir);
+
+    try std.testing.expectEqualStrings("/synthetic/grok-root/sessions", dir);
+    try std.testing.expectEqual(LlmSource.grok, try LlmSource.parse("grok"));
+    try std.testing.expectEqualStrings("grok", LlmSource.grok.label());
+}
+
+test "indexable source set contains every concrete source exactly once" {
+    const expected = [_]LlmSource{ .claude, .codex, .gemini, .grok };
+    try std.testing.expectEqual(expected.len, indexable_sources.len);
+    for (expected) |wanted| {
+        var matches: usize = 0;
+        for (indexable_sources) |actual| {
+            if (actual == wanted) matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+}
+
 test "defaultDbPath returns expected path" {
     const allocator = std.testing.allocator;
     const path = try defaultDbPath(allocator);
@@ -314,6 +356,9 @@ test "LlmSource.fromPath classifies origin CLI over a set of paths" {
     try std.testing.expectEqual(LlmSource.claude, LlmSource.fromPath(home ++ "/.claude/projects/-x-proj/abc.jsonl"));
     try std.testing.expectEqual(LlmSource.codex, LlmSource.fromPath(home ++ "/.codex/sessions/2026/xyz.jsonl"));
     try std.testing.expectEqual(LlmSource.gemini, LlmSource.fromPath(home ++ "/.gemini/tmp/hash/logs.json"));
+    try std.testing.expectEqual(LlmSource.grok, LlmSource.fromPath(home ++ "/.grok/sessions/%2Fwork/session/updates.jsonl"));
+    try std.testing.expectEqual(LlmSource.grok, LlmSource.fromPath("/synthetic/grok-root/sessions/%2Fwork/session/updates.jsonl"));
+    try std.testing.expectEqual(LlmSource.grok, LlmSource.fromPath("C:\\synthetic\\grok-root\\sessions\\group\\session\\updates.jsonl"));
     // Observer sessions live under .claude/projects -> claude, not a new source.
     try std.testing.expectEqual(LlmSource.claude, LlmSource.fromPath(home ++ "/.claude/projects/-home-pmarreck--claude-mem-observer-sessions/s.jsonl"));
     // Unknown layout defaults to claude.
